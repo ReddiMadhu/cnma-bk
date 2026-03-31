@@ -1,0 +1,293 @@
+"""
+geocoder.py — Geoapify geocoding with LRU cache and ISO 3166 state validation.
+"""
+import httpx
+import json
+import logging
+import os
+import pathlib
+import re
+import unicodedata
+from functools import lru_cache
+from typing import Dict, Optional
+
+from address_normalizer import normalize_address_fields
+
+logger = logging.getLogger("geocoder")
+
+GEOAPIFY_API_KEY = os.getenv("GEOAPIFY_API_KEY", "")
+GEOAPIFY_URL = "https://api.geoapify.com/v1/geocode/search"
+GEOCODE_TIMEOUT = 8.0
+
+# ── Reference data ─────────────────────────────────────────────────────────────
+_REF_DIR = pathlib.Path(__file__).parent / "reference"
+_iso3166: Dict[str, str] = {}   # state_name_lower → state_code
+_iso3166r: Dict[str, str] = {}  # state_code_upper → state_name
+_alpha3_to_alpha2: Dict[str, str] = {}
+
+
+def load_reference_data() -> None:
+    """Load ISO reference data from JSON files into module-level dicts."""
+    global _iso3166, _iso3166r, _alpha3_to_alpha2
+
+    states_path = _REF_DIR / "iso3166_states.json"
+    if states_path.exists():
+        data = json.loads(states_path.read_text(encoding="utf-8"))
+        # Expected shape: {"US": {"CA": "California", ...}, ...}
+        # or flat {"California": "CA", ...}
+        for country_or_code, value in data.items():
+            if isinstance(value, dict):
+                # Nested: country_code → {state_code: state_name}
+                for code, name in value.items():
+                    _iso3166[name.lower()] = code.upper()
+                    _iso3166r[code.upper()] = name
+            elif isinstance(value, str):
+                # Flat: state_name → code
+                _iso3166[country_or_code.lower()] = value.upper()
+                _iso3166r[value.upper()] = country_or_code
+        # Also load the alpha-3 → alpha-2 section if present
+        alpha3 = data.get("_alpha3_to_alpha2", {})
+        _alpha3_to_alpha2.update(alpha3)
+
+    logger.info(f"Loaded {len(_iso3166)} ISO-3166 state entries")
+
+
+# ── Address normalisation ──────────────────────────────────────────────────────
+
+def _normalize_address(raw: str) -> str:
+    """Lowercase, remove double spaces, strip punctuation except commas/hyphens."""
+    raw = raw.strip().lower()
+    raw = re.sub(r"[^\w\s,\-]", " ", raw)
+    raw = re.sub(r"\s{2,}", " ", raw)
+    return raw
+
+
+def assemble_address(row: dict, target_format: str = "AIR") -> Optional[str]:
+    """
+    Build an address string from a cleaned row dict for geocoding.
+    Supports both AIR and RMS canonical key names.
+    """
+    def val(*keys: str) -> str:
+        for k in keys:
+            v = row.get(k)
+            if v and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    full = val("FullAddress")
+    if full:
+        return full
+
+    if target_format == "AIR":
+        parts = [
+            val("Street"),
+            val("City"),
+            val("Area"),
+            val("PostalCode"),
+            val("CountryISO"),
+        ]
+    else:  # RMS
+        parts = [
+            val("STREETNAME"),
+            val("CITY"),
+            val("STATECODE"),
+            val("POSTALCODE"),
+            val("CNTRYCODE"),
+        ]
+
+    assembled = ", ".join(p for p in parts if p)
+    return assembled if assembled else None
+
+
+# ── Geocoding ──────────────────────────────────────────────────────────────────
+
+@lru_cache(maxsize=2000)
+def geocode_address(normalized_address: str) -> dict:
+    """
+    Geocode a single normalized address string via Geoapify.
+    Result is fully serialisable (all plain Python types) so it can be cached.
+    """
+    if not normalized_address or not normalized_address.strip():
+        return {"status": "INSUFFICIENT_ADDRESS", "source": "Failed"}
+
+    if not GEOAPIFY_API_KEY:
+        return {"status": "NO_API_KEY", "source": "Failed"}
+
+    params = {
+        "text": normalized_address,
+        "format": "json",
+        "limit": 1,
+        "apiKey": GEOAPIFY_API_KEY,
+    }
+
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=GEOCODE_TIMEOUT) as client:
+                resp = client.get(GEOAPIFY_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            break
+        except httpx.TimeoutException:
+            if attempt == 2:
+                return {"status": "TIMEOUT", "source": "Failed"}
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code >= 500 and attempt < 2:
+                import time; time.sleep(1 * (attempt + 1))
+                continue
+            return {"status": f"HTTP_{exc.response.status_code}", "source": "Failed"}
+        except Exception as exc:
+            return {"status": f"ERROR:{exc}", "source": "Failed"}
+
+    results = data.get("results", [])
+    if not results:
+        return {"status": "NO_RESULTS", "source": "Failed"}
+
+    r = results[0]
+    state_name = r.get("state", "")
+    state_code = _resolve_state_code(state_name)
+    country_raw = (r.get("country_code") or "").strip()
+    country_iso = _resolve_country_alpha2(country_raw)
+
+    return {
+        "status": "OK",
+        "source": "Geocoded",
+        "latitude": r.get("lat"),
+        "longitude": r.get("lon"),
+        "street": _join_street(r),
+        "city": r.get("city") or r.get("town") or r.get("village") or r.get("municipality") or "",
+        "county": r.get("county", ""),
+        "state": state_name,
+        "statecode": state_code,
+        "postcode": r.get("postcode", ""),
+        "country_iso": country_iso,
+        "formatted": r.get("formatted", ""),
+        "confidence": r.get("rank", {}).get("confidence", 0),
+        "state_code_validation": _validate_state_code(state_code),
+    }
+
+
+def _join_street(r: dict) -> str:
+    housenumber = r.get("housenumber", "") or ""
+    street = r.get("street", "") or ""
+    return f"{housenumber} {street}".strip()
+
+
+def _resolve_state_code(state_name: str) -> str:
+    if not state_name:
+        return ""
+    key = state_name.strip().lower()
+    return _iso3166.get(key, state_name[:2].upper() if len(state_name) >= 2 else state_name)
+
+
+def _resolve_country_alpha2(raw: str) -> str:
+    """Convert alpha-2 or alpha-3 country code → alpha-2."""
+    upper = raw.upper().strip()
+    if len(upper) == 2:
+        return upper
+    if upper in _alpha3_to_alpha2:
+        return _alpha3_to_alpha2[upper]
+    return upper
+
+
+def _validate_state_code(code: str) -> str:
+    if not code:
+        return "MISSING"
+    if code.upper() in _iso3166r:
+        return "VALID"
+    if re.match(r"^[A-Z]{2}$", code.upper()):
+        return "UNRECOGNIZED"
+    return "INVALID_FORMAT"
+
+
+# ── Row-level geocoding decision ───────────────────────────────────────────────
+
+def process_row_geocoding(row: dict, column_map: dict,
+                           target_format: str = "AIR") -> dict:
+    """
+    Apply the geocoding decision tree to one row.
+    1. Clean all address fields via address_normalizer.
+    2. If valid coordinates already present, trust them.
+    3. Otherwise assemble address string and geocode via Geoapify.
+    Returns a dict of geo fields to merge into the row.
+    """
+    row_idx = row.get("_row_index", 0)
+
+    # ── Step 1: Normalize address fields — clean before geocoding ─────────────
+    row, _addr_flags = normalize_address_fields(row, row_idx, target_format)
+    # (flags returned here are already collected by the caller in normalize_all_rows;
+    #  pass-through flags can optionally be merged if needed)
+
+    lat = row.get("Latitude")
+    lon = row.get("Longitude")
+
+    # ── Step 2: Valid coordinates already present — trust them ────────────────
+    if _is_valid_lat(lat) and _is_valid_lon(lon):
+        return {
+            "Latitude":        float(lat),
+            "Longitude":       float(lon),
+            "Geosource":       "Provided",
+            "GeocodingStatus": "PROVIDED",
+        }
+
+    # ── Step 3: Assemble cleaned address and geocode ───────────────────────────
+    address_raw = assemble_address(row, target_format)
+    if not address_raw:
+        return {
+            "Geosource":       "Failed",
+            "GeocodingStatus": "INSUFFICIENT_ADDRESS",
+        }
+
+    normalized = _normalize_address(address_raw)
+    result = geocode_address(normalized)
+
+    if result["status"] != "OK":
+        return {
+            "Geosource":       "Failed",
+            "GeocodingStatus": result["status"],
+        }
+
+    # ── Step 4: Map Geoapify result back to canonical key names ───────────────
+    if target_format == "AIR":
+        return {
+            "Latitude":          result["latitude"],
+            "Longitude":         result["longitude"],
+            "Street":            result["street"],
+            "City":              result["city"],
+            "Area":              result["statecode"],
+            "PostalCode":        result["postcode"],
+            "CountryISO":        result["country_iso"],
+            "GeocodingStatus":   "OK",
+            "Geosource":         "Geocoded",
+            "Geo_Confidence":    result["confidence"],
+            "StateCodeValidation": result["state_code_validation"],
+        }
+    else:  # RMS
+        return {
+            "Latitude":          result["latitude"],
+            "Longitude":         result["longitude"],
+            "STREETNAME":        result["street"],
+            "CITY":              result["city"],
+            "STATECODE":         result["statecode"],
+            "POSTALCODE":        result["postcode"],
+            "CNTRYCODE":         result["country_iso"],
+            "GeocodingStatus":   "OK",
+            "Geosource":         "Geocoded",
+            "Geo_Confidence":    result["confidence"],
+            "StateCodeValidation": result["state_code_validation"],
+        }
+
+
+def _is_valid_lat(v) -> bool:
+    try:
+        f = float(v)
+        return -90 <= f <= 90 and f != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_valid_lon(v) -> bool:
+    try:
+        f = float(v)
+        return -180 <= f <= 180 and f != 0
+    except (TypeError, ValueError):
+        return False
