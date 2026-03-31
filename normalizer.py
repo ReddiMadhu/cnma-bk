@@ -104,56 +104,6 @@ def _normalize_year(row: dict, row_idx: int, rules: BusinessRulesConfig,
 
         flags.append(_make_flag(row_idx, year_key, "out_of_range_year",
                                 year, f"Year {year} outside range [{rules.year_min}–{rules.year_max}]"))
-    else:
-        row[year_key] = year
-
-    # Pre-1940 masonry check
-        if year < 1940 and row.get("ConstructionCode") in MASONRY_CODES_AIR:
-            method = row.get("Occupancy_Method", "")
-            if method not in ("llm", "user_override"):
-                flags.append(_make_flag(row_idx, "ConstructionCode", "pre1940_masonry",
-                                        row.get("ConstructionCode"),
-                                        "Pre-1940 masonry — verify ductility. Consider unreinforced masonry codes (111–114)."))
-
-    return row, flags
-
-# Extract first 4-digit year matching 18xx|19xx|20xx
-    match = re.search(r"\b(18|19|20)\d{2}\b", str(raw))
-    if not match:
-        row[year_key] = None
-        row["Year_Built_Flag"] = "UNPARSEABLE"
-        if str(raw).strip():
-            flags.append(_make_flag(row_idx, year_key, "unparseable_year",
-                                    raw, f"Cannot parse year from '{raw}'"))
-        return row, flags
-
-    year = int(match.group())
-    row["Year_Built_Flag"] = "VALID"
-
-    if not (rules.year_min <= year <= rules.year_max):
-        row["Year_Built_Flag"] = "OUT_OF_RANGE"
-        action = rules.invalid_year_action
-        if action == "reset_year":
-            row[year_key] = None
-            row["Year_Built_Original"] = year
-        elif action == "set_default":
-            row[year_key] = rules.year_default
-            row["Year_Built_Original"] = year
-        else:  # flag_review or none
-            row[year_key] = year
-
-        flags.append(_make_flag(row_idx, year_key, "out_of_range_year",
-                                year, f"Year {year} outside range [{rules.year_min}–{rules.year_max}]"))
-    else:
-        row[year_key] = year
-
-    # Pre-1940 masonry check
-    if year < 1940 and row.get("ConstructionCode") in MASONRY_CODES_AIR:
-        method = row.get("Occupancy_Method", "")
-        if method not in ("llm", "user_override"):
-            flags.append(_make_flag(row_idx, "ConstructionCode", "pre1940_masonry",
-                                    row.get("ConstructionCode"),
-                                    "Pre-1940 masonry — verify ductility. Consider unreinforced masonry codes (111–114)."))
     return row, flags
 
 
@@ -664,6 +614,10 @@ VALUE_FIELDS_AIR = [
 ]
 
 VALUE_FIELDS_RMS = [
+    # (src_field_candidates, dest_field, max_rule_attr)
+    # src_field_candidates: list of keys to try in order; first non-None wins.
+    # This handles both: column already remapped to canonical RMS key (e.g. EQCV1VAL)
+    # AND: column still sitting under an intermediate AIR-style key (BuildingValue).
     ("BuildingValue",    "EQCV1VAL",  "max_building_value"),
     ("ContentsValue",    "EQCV2VAL",  "max_contents_value"),
     ("TimeElementValue", "EQCV3VAL",  "max_bi_value"),
@@ -678,7 +632,13 @@ def _normalize_values(row: dict, row_idx: int, rules: BusinessRulesConfig,
     value_fields = VALUE_FIELDS_AIR if target == "AIR" else VALUE_FIELDS_RMS
 
     for src_field, dest_field, max_attr in value_fields:
-        raw = row.get(src_field)
+        # For RMS: the source value may sit under the AIR intermediate key OR
+        # already under the dest canonical key (if the column mapper wrote it there).
+        # Try dest first (most specific), then fall back to src_field.
+        if target == "RMS":
+            raw = row.get(dest_field) or row.get(src_field)
+        else:
+            raw = row.get(src_field)
         val = _parse_value(raw)
         if val is None:
             flags.append(_make_flag(row_idx, dest_field, "unparseable_value",

@@ -322,9 +322,11 @@ RMS_CANONICAL_FIELDS: Dict[str, List[str]] = {
         "apartment community", "community name",
         "building name", "loc name", "locname"
     ],
-    "STREETNAME":   ["street", "address", "street address", "streetname", "addr"],
+    "STREETNAME":   ["street", "address", "street address", "streetname", "addr",
+                     "street name", "addr line 1", "address 1", "address1"],
     "CITY":         ["city", "town", "municipality"],
-    "STATECODE":    ["state", "province", "region", "statecode", "state code"],
+    "STATECODE":    ["state", "province", "region", "statecode", "state code",
+                     "county", "parish", "borough", "district"],
     "POSTALCODE":   ["zip", "postal code", "postcode", "postalcode", "zip code"],
     "CNTRYCODE":    ["country", "country code", "cntry", "cntrycode", "iso country"],
     "Latitude":     ["latitude", "lat", "y coordinate"],

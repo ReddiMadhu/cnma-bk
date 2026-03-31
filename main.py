@@ -234,10 +234,37 @@ def suggest_columns_endpoint(upload_id: str):
 
 @app.post("/confirm-columns/{upload_id}", response_model=ConfirmColumnsResponse, tags=["Pipeline"])
 def confirm_columns(upload_id: str, body: ConfirmColumnsRequest):
-    """Confirm and persist the column mapping. Validates required fields."""
+    """Confirm and persist the column mapping. Validates required fields and 1:1 uniqueness."""
     session = _get_session_or_404(upload_id)
 
     column_map = body.column_map
+
+    # ── Enforce 1:1 mapping: one source → one canonical, one canonical ← one source ──
+    # Collect which source columns map to each canonical (ignoring None/unmapped).
+    canonical_to_sources: Dict[str, List[str]] = {}
+    for src_col, canonical in column_map.items():
+        if canonical is None:
+            continue
+        canonical_to_sources.setdefault(canonical, []).append(src_col)
+
+    # Find violations: any canonical claimed by more than one source column
+    duplicate_violations = {
+        canonical: sources
+        for canonical, sources in canonical_to_sources.items()
+        if len(sources) > 1
+    }
+
+    if duplicate_violations:
+        details = "; ".join(
+            f"'{canonical}' claimed by: {sources}"
+            for canonical, sources in duplicate_violations.items()
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Mapping violation — each canonical field must be mapped by exactly one source column. "
+                   f"Duplicates found: {details}",
+        )
+
     unmapped = [k for k, v in column_map.items() if v is None]
     mapped_count = len(column_map) - len(unmapped)
 
@@ -280,7 +307,10 @@ def geocode_endpoint(upload_id: str):
     geo_rows: List[dict] = []
 
     for idx, row in enumerate(remapped):
-        geo_fields = geocoder.process_row_geocoding(row, column_map)
+        geo_fields = geocoder.process_row_geocoding(
+            row, column_map,
+            target_format=session.get("target_format", "AIR"),
+        )
         row.update(geo_fields)
         geo_rows.append(row)
 
@@ -393,8 +423,9 @@ def map_codes_endpoint(upload_id: str):
             if result:
                 # ── Write mapped integer code to the canonical column the output builder reads ──
                 row[occ_value_col] = result["code"]      # e.g. row["OccupancyCode"] = 302
-                # Write scheme label to scheme column
-                row[target_occ_scheme] = target          # e.g. "AIR" or "RMS"
+                # Write scheme label only if not already set by the source data
+                if not row.get(target_occ_scheme):
+                    row[target_occ_scheme] = target
                 # Preserve metadata in internal audit fields
                 row["Occupancy_Code"]        = result["code"]
                 row["Occupancy_Description"] = result["description"]
@@ -422,8 +453,9 @@ def map_codes_endpoint(upload_id: str):
             if result:
                 # ── Write mapped integer code to the canonical column the output builder reads ──
                 row[const_value_col] = result["code"]    # e.g. row["ConstructionCode"] = 215
-                # Write scheme label to scheme column
-                row[target_const_scheme] = target        # e.g. "AIR" or "RMS"
+                # Write scheme label only if not already set by the source data
+                if not row.get(target_const_scheme):
+                    row[target_const_scheme] = target
                 # Preserve metadata in internal audit fields
                 row["Construction_Code"]        = result["code"]
                 row["Construction_Description"] = result["description"]
@@ -656,18 +688,28 @@ def health():
 def _apply_column_map(raw_rows: List[Dict], column_map: Dict[str, Optional[str]]) -> List[Dict]:
     """
     Return a new list of row dicts where keys are canonical field names.
-    Source columns mapped to None are passed through as-is.
+    Enforces 1:1 at apply-time: if two source columns map to the same canonical,
+    the first one encountered wins and the second is skipped with a warning.
+    Source columns mapped to None are dropped (not passed through).
     """
+    # Build a deduplicated ordered mapping: canonical → first src col that claimed it
+    canonical_claimed_by: Dict[str, str] = {}
+    for src_col, canonical in column_map.items():
+        if canonical is None:
+            continue
+        if canonical not in canonical_claimed_by:
+            canonical_claimed_by[canonical] = src_col
+        else:
+            logger.warning(
+                f"_apply_column_map: canonical '{canonical}' already claimed by "
+                f"'{canonical_claimed_by[canonical]}'; skipping duplicate source '{src_col}'."
+            )
+
     result = []
     for row in raw_rows:
         new_row: Dict[str, Any] = {}
-        for src_col, canonical in column_map.items():
-            val = row.get(src_col)
-            if canonical:
-                new_row[canonical] = val
-            else:
-                # passthrough
-                new_row[src_col] = val
+        for canonical, src_col in canonical_claimed_by.items():
+            new_row[canonical] = row.get(src_col)
         result.append(new_row)
     return result
 

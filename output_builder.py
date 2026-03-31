@@ -100,8 +100,9 @@ def build_xlsx(
     ws_loc = wb.create_sheet("Locations")
 
     base_cols = AIR_OUTPUT_COLUMNS if target_format == "AIR" else RMS_OUTPUT_COLUMNS
-    extra_cols = sorted(c for c in unmapped_cols if c not in base_cols)
-    final_cols = base_cols + extra_cols
+    # Only output the canonical schema columns — unmapped source columns are
+    # excluded from the Locations sheet to keep output clean and EDM-compliant.
+    final_cols = base_cols
 
     # Styled header row
     header_cells = []
@@ -183,8 +184,8 @@ def build_csv(
 ) -> io.BytesIO:
     """Build a CSV output in the canonical column order. Returns BytesIO."""
     base_cols = AIR_OUTPUT_COLUMNS if target_format == "AIR" else RMS_OUTPUT_COLUMNS
-    extra_cols = sorted(c for c in unmapped_cols if c not in base_cols)
-    final_cols = base_cols + extra_cols
+    # Only output the canonical schema columns
+    final_cols = base_cols
 
     if target_format == "RMS":
         _clone_rms_perils(rows)

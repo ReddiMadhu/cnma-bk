@@ -227,9 +227,39 @@ def build_tfidf_indexes() -> None:
 
     _occ_codes = load_json("air_occ_codes.json")
     _const_codes = load_json("air_const_codes.json")
-    _rms_occ_codes = load_json("rms_occ_codes.json")
-    _rms_const_codes = load_json("rms_const_codes.json")
     _abbreviations = load_json("abbreviations.json")
+
+    # ── Build RMS occupancy registry from atc_to_air_occ_map.json ────────────
+    # Keys are ATC numeric strings ("1".."54"); values carry description + air_code.
+    # We expose these as the RMS occupancy code registry so the deterministic
+    # matcher and LLM classify directly into ATC numeric codes, NOT Res4/Res3.
+    _atc_raw = load_json("atc_to_air_occ_map.json").get("atc_to_air", {})
+    _rms_occ_codes.clear()
+    for atc_key, meta in _atc_raw.items():
+        _rms_occ_codes[atc_key] = {
+            "description": meta.get("description", ""),
+            "keywords":    [meta.get("description", "").lower()],
+            "air_code":    meta.get("air_code", ""),
+        }
+    logger.info(f"RMS occ registry built from atc_to_air_occ_map: {len(_rms_occ_codes)} codes")
+
+    # ── Build RMS construction registry from rms_to_air_const_map.json ───────
+    # Keys are RMS numeric/alpha-numeric codes ("1", "2B", "3A1", "4A", …).
+    # rms_desc is used as the description/keyword for the deterministic matcher.
+    _rms_const_codes.clear()
+    _rms_const_raw = load_json("rms_to_air_const_map.json")
+    _lookup_priority = ["advanced_structural", "basic", "infrastructure", "tanks", "industrial_equipment"]
+    for category in _lookup_priority:
+        for rms_code, meta in _rms_const_raw.get(category, {}).items():
+            if rms_code not in _rms_const_codes:  # advanced beats basic for same key
+                desc = meta.get("rms_desc", "")
+                _rms_const_codes[rms_code] = {
+                    "description": desc,
+                    "keywords":    [desc.lower()],
+                    "air_code":    meta.get("air_class", ""),
+                    "category":    category,
+                }
+    logger.info(f"RMS const registry built from rms_to_air_const_map: {len(_rms_const_codes)} codes")
 
     # Load new reference maps
     iso_data = load_json("iso_const_map.json")
@@ -767,24 +797,28 @@ def _node_conflict(state: CodeMappingState) -> CodeMappingState:
             if state["target"] == "AIR":
                 code = conflict_result.air_code
                 desc = _const_codes.get(code, {}).get("description", conflict_result.final_category)
+                results[str(idx)] = {
+                    "code": code,
+                    "confidence": conflict_result.confidence,
+                    "description": desc,
+                    "method": "conflict_rule",
+                    "original": raw_value,
+                    "alternatives": conflict_result.alternatives,
+                    "reasoning": conflict_result.reasoning,
+                    "abbreviation_expanded": was_expanded,
+                    "conflict_flag": conflict_result.conflict_flag,
+                    "rule_applied": conflict_result.rule_applied,
+                }
             else:
-                # For RMS target, conflict resolver gives us an AIR code — map back
-                # (conservative: use Unknown if no RMS equivalent)
-                code = "W1"  # default to Wood Light Frame for RMS unknown hybrid
-                desc = conflict_result.final_category
-
-            results[str(idx)] = {
-                "code": code,
-                "confidence": conflict_result.confidence,
-                "description": desc,
-                "method": "conflict_rule",
-                "original": raw_value,
-                "alternatives": conflict_result.alternatives,
-                "reasoning": conflict_result.reasoning,
-                "abbreviation_expanded": was_expanded,
-                "conflict_flag": conflict_result.conflict_flag,
-                "rule_applied": conflict_result.rule_applied,
-            }
+                # For RMS target: conflict resolver returns an AIR code, but we need
+                # the RMS numeric code. Do NOT hardcode W1 — pass to LLM with the
+                # conflict reasoning as a hint so it picks the correct RMS code.
+                conflict_hints[str(idx)] = conflict_result
+                pending_llm.append(idx)
+                logger.debug(
+                    f"RMS target conflict item {idx} '{raw_value}' deferred to LLM "
+                    f"with conflict hint: {conflict_result.final_category}"
+                )
         elif conflict_result:
             # Medium confidence → store as hint for LLM, but still run deterministic
             conflict_hints[str(idx)] = conflict_result
