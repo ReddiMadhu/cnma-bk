@@ -49,132 +49,99 @@ def _make_flag(row_index: int, field: str, issue: str, current_value: Any,
 
 # ── Year built ─────────────────────────────────────────────────────────────────
 
-def _normalize_year(row: dict, row_idx: int, rules: BusinessRulesConfig,
-                    target: str = "AIR") -> Tuple[dict, List[dict]]:
+def _normalize_years(row: dict, row_idx: int, rules: BusinessRulesConfig, target: str = "AIR") -> Tuple[dict, List[dict]]:
     flags = []
-    year_key = "YearBuilt" if target == "AIR" else "YEARBUILT"
-    retro_key = "YearRetrofitted" if target == "AIR" else "YEARUPGRAD"
-    raw = row.get("YearBuilt") or row.get("YEARBUILT") or row.get(year_key)
-    if raw is None or str(raw).strip() == "":
-        return row, flags
-
-    s = str(raw).strip()
-
-    if re.match(r"^\s*-\s*\d{4}\s*$", s):
-        flags.append(_make_flag(row_idx, year_key, "negative_year_built",
-                                raw, f"Negative year '{raw}' — blanked."))
-        row[year_key] = None
-        row["Year_Built_Flag"] = "UNPARSEABLE"
-        return row, flags
-
-    years = [int(m) for m in re.findall(r"\b(18\d{2}|19\d{2}|20\d{2})\b", s)]
-    
-    if not years:
-        for m in re.findall(r"\b(\d{2})\b", s):
-            yy = int(m)
-            year = 1900 + yy if yy >= 25 else 2000 + yy
-            years.append(year)
-            
-    if not years:
-        row[year_key] = None
-        row["Year_Built_Flag"] = "UNPARSEABLE"
-        flags.append(_make_flag(row_idx, year_key, "unparseable_year",
-                                raw, f"Cannot parse year from '{raw}' — blanked."))
-        return row, flags
-
-    original_num_years = len(years)
-    year = min(years)
-    row["Year_Built_Flag"] = "VALID"
-
-    if original_num_years > 1:
-        flags.append(_make_flag(row_idx, year_key, "multiple_years_extracted",
-                                raw, f"Multiple years found; selected earliest {year} from '{raw}'."))
-
-    if not (rules.year_min <= year <= rules.year_max):
-        row["Year_Built_Flag"] = "OUT_OF_RANGE"
-        action = rules.invalid_year_action
-        if action == "reset_year":
-            row[year_key] = None
-            row["Year_Built_Original"] = year
-        elif action == "set_default":
-            row[year_key] = rules.year_default
-            row["Year_Built_Original"] = year
-        else:
-            row[year_key] = year
-
-        flags.append(_make_flag(row_idx, year_key, "out_of_range_year",
-                                year, f"Year {year} outside range [{rules.year_min}–{rules.year_max}]"))
-    return row, flags
-
-
-
-_EXCLUDE_UPGRADES = re.compile(
-    r"\b(roof|electrical|plumb|hvac|mechanical|cosmetic|interior|tenant|appraisal)\b",
-    re.IGNORECASE
-)
-
-_INCLUDE_UPGRADES = re.compile(
-    r"\b(upgrade|renovat|retrofit|rehab|modernize|code|reconstruct|rebuilt|reno)\b",
-    re.IGNORECASE
-)
-
-def _normalize_upgraded_year(row: dict, row_idx: int, rules: BusinessRulesConfig,
-                             target: str = "AIR") -> Tuple[dict, List[dict]]:
-    flags = []
-    upg_key = "YearRetrofitted" if target == "AIR" else "YEARUPGRAD"
-    
-    raw = row.get("YearRetrofitted") or row.get("YEARUPGRAD") or row.get(upg_key)
-    
-    if raw is None or str(raw).strip() == "":
-        row[upg_key] = None
-        return row, flags
-
-    s = str(raw).strip()
-    s_lower = s.lower()
-
-    if _EXCLUDE_UPGRADES.search(s_lower) and not _INCLUDE_UPGRADES.search(s_lower):
-        flags.append(_make_flag(row_idx, upg_key, "ignored_upgrade",
-                                raw, f"Ignored non-structural upgrade '{raw}' — returning 9999."))
-        row[upg_key] = 9999
-        return row, flags
-
-    years = [int(m) for m in re.findall(r"\b(18\d{2}|19\d{2}|20\d{2})\b", s)]
-    
-    if not years:
-        row[upg_key] = None
-        return row, flags
-
-    # Read the year_built that was just resolved by _normalize_year
     yb_key = "YearBuilt" if target == "AIR" else "YEARBUILT"
-    year_built = row.get(yb_key)
+    upg_key = "YearRetrofitted" if target == "AIR" else "YEARUPGRAD"
 
-    if not year_built:
-        flags.append(_make_flag(row_idx, upg_key, "upgrade_missing_built",
-                                raw, f"Upgrade year '{raw}' ignored because YearBuilt is empty."))
+    raw_built = str(row.get("YearBuilt") or row.get("YEARBUILT") or row.get(yb_key) or "").strip()
+    raw_upgrad = str(row.get("YearRetrofitted") or row.get("YEARUPGRAD") or row.get(upg_key) or "").strip()
+
+    combined_raw = f"{raw_built} {raw_upgrad}".strip()
+    if not combined_raw:
+        row[yb_key] = None
         row[upg_key] = None
         return row, flags
 
-    upgrade_years = [y for y in years if y != year_built]
+    s_lower = combined_raw.lower()
 
-    if not upgrade_years:
-        flags.append(_make_flag(row_idx, upg_key, "upgrade_same_as_built",
-                                raw, f"Upgrade year matches Built year — returning 9999."))
-        row[upg_key] = 9999
+    # Alpha Year "198X" rule
+    if re.search(r"\b19\d[a-zA-Z]\b", s_lower) or re.search(r"\b20\d[a-zA-Z]\b", s_lower):
+        flags.append(_make_flag(row_idx, yb_key, "invalid_alpha_year", combined_raw, "Alpha year like 198X -> blank"))
+        row[yb_key] = None
+        row[upg_key] = None
         return row, flags
 
-    year_upgraded = max(upgrade_years)
+    # Find 4-digit years
+    years = [int(m) for m in re.findall(r"\b(1\d{3}|2\d{3})\b", s_lower)]
     
-    if year_upgraded <= year_built:
-        flags.append(_make_flag(row_idx, upg_key, "upgrade_before_built",
-                                raw, f"Upgrade year {year_upgraded} <= Built {year_built} — returning 9999."))
-        row[upg_key] = 9999
+    # Check 2-digit years if no 4-digits
+    if not years:
+        for m in re.findall(r"\b(\d{2})\b", s_lower):
+            yy = int(m)
+            years.append(1900 + yy if yy >= 25 else 2000 + yy)
+
+    # Filter years (1700 to 2026 allowed)
+    valid_years = sorted(list(set(y for y in years if 1700 <= y <= 2026)))
+
+    if not valid_years:
+        row[yb_key] = None
+        row[upg_key] = None
+        flags.append(_make_flag(row_idx, yb_key, "unparseable_year", combined_raw, "No valid year extracted."))
         return row, flags
 
-    if year_upgraded > 2026:
-        row[upg_key] = 9999
-        return row, flags
+    # EXCLUDE/INCLUDE checking
+    exclude_pattern = re.compile(r"\b(roofs?|electrical|plumb(?:ing)?|hvac|mechanical|cosmetic|interior|tenant|appraisal)\b", re.IGNORECASE)
+    include_pattern = re.compile(r"\b(upgrade[sd]?|renovat(?:e|ed|ion)?|retrofit(?:ted)?|rehab(?:bed)?|modernize[sd]?|code|reconstruct(?:ion|ed)?|rebuilt|reno|seismic(?:ally)?|update[sd]?)\b", re.IGNORECASE)
+    bld_pattern = re.compile(r"\b(build|built|construct(?:ed|ion)?|\byob\b|original(?:ly)?|circa|approx|phase|rebuilt|rebuild)\b", re.IGNORECASE)
 
-    row[upg_key] = year_upgraded
+    has_include = include_pattern.search(s_lower)
+    has_exclude = exclude_pattern.search(s_lower)
+    has_bld = bld_pattern.search(s_lower)
+
+    year_built = None
+    upgrade_year = None
+
+    if len(valid_years) == 1:
+        y = valid_years[0]
+        # Assign correctly based on which raw string contains the year
+        if str(y) in str(raw_built):
+            year_built = y
+        elif str(y) in str(raw_upgrad):
+            upgrade_year = y
+            year_built = None
+        else:
+            year_built = y
+    else:
+        # Multiple years present
+        year_built = min(valid_years)
+        upgrade_candidate_years = [y for y in valid_years if y > year_built]
+        
+        if upgrade_candidate_years:
+            if has_include:
+                upgrade_year = max(upgrade_candidate_years)
+            elif has_exclude:
+                # roof replaced 2008 without structural word -> Ignore upgrade
+                upgrade_year = None
+            else:
+                # No specific words, e.g. "1990/2012" -> Treat max as structural upgrade 
+                upgrade_year = max(upgrade_candidate_years)
+
+    row[yb_key] = year_built
+
+    if upgrade_year:
+        row[upg_key] = upgrade_year
+    elif year_built and (has_exclude or has_include):
+        row[upg_key] = 9999
+    elif year_built and len(valid_years) == 1:
+        row[upg_key] = 9999
+    else:
+        row[upg_key] = 9999 if year_built else None
+
+    # Blank out if no year built
+    if not year_built:
+        row[upg_key] = None
+
     return row, flags
 
 
@@ -584,28 +551,44 @@ def _normalize_area(row: dict, row_idx: int, rules: BusinessRulesConfig,
 
 # ── Financial values ───────────────────────────────────────────────────────────
 
+_CURRENCY_SYMBOLS = {
+    "$": "USD",
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "₹": "INR"
+}
+
 _CURRENCY_STRIP = re.compile(r"[$€£¥₹,\s]")
 _SHORTHAND = re.compile(r"^([\d.]+)\s*([KMBkmb])$")
 
-def _parse_value(raw: Any) -> float:
+def _parse_value(raw: Any) -> Tuple[Optional[float], Optional[str]]:
     if raw is None or str(raw).strip() == "":
-        return 0
-    s = _CURRENCY_STRIP.sub("", str(raw).strip())
+        return None, None
+    raw_str = str(raw).strip()
+    
+    cur_code = None
+    for sym, code in _CURRENCY_SYMBOLS.items():
+        if sym in raw_str:
+            cur_code = code
+            break
+            
+    s = _CURRENCY_STRIP.sub("", raw_str)
     
     if s == '-' or s.lower() in ('n/a', 'na', 'none', 'nil'):
-        return 0
+        return 0, cur_code
         
     m = _SHORTHAND.match(s)
     if m:
         num, suffix = float(m.group(1)), m.group(2).upper()
         multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(suffix, 1)
         val = num * multiplier
-        return int(round(val))
+        return int(round(val)), cur_code
     try:
         val = float(s)
-        return int(round(val))
+        return int(round(val)), cur_code
     except ValueError:
-        return 0
+        return None, cur_code
 
 VALUE_FIELDS_AIR = [
     ("BuildingValue",    "BuildingValue",    "max_building_value"),
@@ -639,7 +622,18 @@ def _normalize_values(row: dict, row_idx: int, rules: BusinessRulesConfig,
             raw = row.get(dest_field) or row.get(src_field)
         else:
             raw = row.get(src_field)
-        val = _parse_value(raw)
+        
+        val, cur_code = _parse_value(raw)
+        
+        if cur_code:
+            if target == "RMS":
+                lcur_key = dest_field.replace("VAL", "LCUR")
+                if not row.get(lcur_key):
+                    row[lcur_key] = cur_code
+            else:
+                if not row.get("Currency"):
+                    row["Currency"] = cur_code
+
         if val is None:
             flags.append(_make_flag(row_idx, dest_field, "unparseable_value",
                                     raw, f"Cannot parse numeric value from '{raw}'"))
@@ -671,7 +665,8 @@ def _normalize_values(row: dict, row_idx: int, rules: BusinessRulesConfig,
 def _normalize_currency(row: dict, row_idx: int, valid_currencies: set) -> Tuple[dict, List[dict]]:
     flags = []
     currency_cols = [
-        "Currency", "EQCV3LCUR", "WSCV3LCUR", "TOCV3LCUR",
+        "Currency", "CV1LCUR", "CV2LCUR", "CV3LCUR",
+        "EQCV1LCUR", "EQCV2LCUR", "EQCV3LCUR", "WSCV3LCUR", "TOCV3LCUR",
         "HUCV3LCUR", "FPCV3LCUR", "TRCV3LCUR",
     ]
     found_currencies = set()
@@ -700,7 +695,11 @@ def _normalize_currency(row: dict, row_idx: int, valid_currencies: set) -> Tuple
                                 f"Currency conflict: multiple currencies found: {found_currencies}"))
         row["Currency_Conflicts"] = True
     elif found_currencies:
-        row["Currency"] = list(found_currencies)[0]
+        resolved = list(found_currencies)[0]
+        row["Currency"] = resolved
+        row["EQCV1LCUR"] = resolved
+        row["EQCV2LCUR"] = resolved
+        row["EQCV3LCUR"] = resolved
 
     return row, flags
 
@@ -726,61 +725,114 @@ def _normalize_sprinkler(row: dict, row_idx: int,
     return row, flags
 
 
-# ── Roof / Wall / Foundation / Soft-Story (AIR modifier fields) ────────────────
+# ── Roof / Wall / Foundation / Soft-Story (target-aware modifier mapping) ──────
+
+def _first_valid(row: dict, *keys: str) -> Any:
+    for k in keys:
+        v = row.get(k)
+        if v is not None:
+            s = str(v).strip().lower()
+            if s != "nan" and s != "":
+                return v
+    return None
 
 def _normalize_modifiers(row: dict, row_idx: int,
                           target: str = "AIR") -> Tuple[dict, List[dict]]:
+    """
+    Map secondary modifier fields using vendor-correct code schemas.
+
+    AIR target : RoofGeometry → roof_cover (0-11),  WallSiding/WallType → wall_type (0-9)
+    RMS target : ROOFGEOM    → rms_roofsys (0-9),   CLADDING/WALLTYPE  → rms_cladsys (0-10)
+    Both targets: foundation_type (0-12), soft_story (0-2) — identical codes.
+    """
     flags = []
 
-    roof_key = "RoofGeometry" if target == "AIR" else "ROOFGEOM"
-    wall_key = "WallSiding" if target == "AIR" else "CLADDING"
-    found_key = "FoundationType" if target == "AIR" else "FOUNDATION"
-    soft_key = "SoftStory" if target == "AIR" else "SOFTSTORY"
-    walltype_key = "WallType" if target == "AIR" else "WALLTYPE"
+    roof_key     = "RoofGeometry"   if target == "AIR" else "ROOFGEOM"
+    wall_key     = "WallSiding"     if target == "AIR" else "CLADDING"
+    found_key    = "FoundationType" if target == "AIR" else "FOUNDATION"
+    soft_key     = "SoftStory"      if target == "AIR" else "SOFTSTORY"
+    walltype_key = "WallType"       if target == "AIR" else "WALLTYPE"
 
-    mapper = get_mapper() # Default LLM enabled from API key, handled gracefully
+    mapper = get_mapper()  # LLM enabled from API key, handled gracefully
 
     sub_row = {
-        "roof_cover": row.get(roof_key),
-        "wall_type": row.get(wall_key) or row.get(walltype_key),
-        "foundation_type": row.get(found_key),
-        "soft_story": row.get(soft_key),
+        "roof_cover":      _first_valid(row, roof_key),
+        "wall_type":       _first_valid(row, wall_key, walltype_key),
+        "foundation_type": _first_valid(row, found_key),
+        "soft_story":      _first_valid(row, soft_key),
     }
 
-    result = mapper.map_all(sub_row)
+    # ── Branch on target: use vendor-specific schemas for roof and wall ────────
+    if target == "AIR":
+        result  = mapper.map_all(sub_row)
+        roof_code_key  = "roof_cover"
+        wall_code_key  = "wall_type"
+    else:  # RMS
+        result  = mapper.map_all_rms(sub_row)
+        roof_code_key  = "rms_roofsys"
+        wall_code_key  = "rms_cladsys"
+
     methods = result.get("_methods", {})
 
+    # ── Roof ───────────────────────────────────────────────────────────────────
     if row.get(roof_key) is not None:
-        row[roof_key] = result["roof_cover"]
-        if methods.get("roof_cover") not in ("empty", "integer"):
+        row[roof_key] = result[roof_code_key]
+        method = methods.get(roof_code_key)
+        if method not in ("empty", "integer"):
             flags.append(_make_flag(row_idx, roof_key, "mapped_modifier",
-                                    row.get(roof_key), f"Mapped roof cover via {methods.get('roof_cover')} → {result['roof_cover_desc']}"))
+                                    row.get(roof_key),
+                                    f"Mapped roof ({roof_code_key}) via {method} "
+                                    f"→ {result[roof_code_key + '_desc']}"))
 
-    # WallSiding (AIR) or CLADDING (RMS)
+    # ── Wall / Cladding ────────────────────────────────────────────────────────
     if row.get(wall_key) is not None:
-        row[wall_key] = result["wall_type"]
-        if methods.get("wall_type") not in ("empty", "integer"):
+        row[wall_key] = result[wall_code_key]
+        method = methods.get(wall_code_key)
+        if method not in ("empty", "integer"):
             flags.append(_make_flag(row_idx, wall_key, "mapped_modifier",
-                                    row.get(wall_key), f"Mapped wall type via {methods.get('wall_type')} → {result['wall_type_desc']}"))
-    
-    # AIR specifically also has WallType (same integer code schema as WallSiding)
+                                    row.get(wall_key),
+                                    f"Mapped wall ({wall_code_key}) via {method} "
+                                    f"→ {result[wall_code_key + '_desc']}"))
+
+    # AIR WallType column (same AIR schema as WallSiding — both use wall_type codes)
     if target == "AIR" and row.get(walltype_key) is not None:
         row[walltype_key] = result["wall_type"]
-        if methods.get("wall_type") not in ("empty", "integer"):
+        method = methods.get("wall_type")
+        if method not in ("empty", "integer"):
             flags.append(_make_flag(row_idx, walltype_key, "mapped_modifier",
-                                    row.get(walltype_key), f"Mapped wall type via {methods.get('wall_type')} → {result['wall_type_desc']}"))
+                                    row.get(walltype_key),
+                                    f"Mapped wall_type via {method} "
+                                    f"→ {result['wall_type_desc']}"))
 
+    # RMS also has a WALLTYPE column — write rms_cladsys code there too
+    if target == "RMS" and row.get(walltype_key) is not None:
+        row[walltype_key] = result["rms_cladsys"]
+        method = methods.get("rms_cladsys")
+        if method not in ("empty", "integer"):
+            flags.append(_make_flag(row_idx, walltype_key, "mapped_modifier",
+                                    row.get(walltype_key),
+                                    f"Mapped rms_cladsys via {method} "
+                                    f"→ {result['rms_cladsys_desc']}"))
+
+    # ── Foundation ─────────────────────────────────────────────────────────────
     if row.get(found_key) is not None:
         row[found_key] = result["foundation_type"]
-        if methods.get("foundation_type") not in ("empty", "integer"):
+        method = methods.get("foundation_type")
+        if method not in ("empty", "integer"):
             flags.append(_make_flag(row_idx, found_key, "mapped_modifier",
-                                    row.get(found_key), f"Mapped foundation via {methods.get('foundation_type')} → {result['foundation_type_desc']}"))
+                                    row.get(found_key),
+                                    f"Mapped foundation via {method} "
+                                    f"→ {result['foundation_type_desc']}"))
 
+    # ── Soft story ─────────────────────────────────────────────────────────────
     if row.get(soft_key) is not None:
         row[soft_key] = result["soft_story"]
-        if methods.get("soft_story") not in ("empty", "integer"):
+        method = methods.get("soft_story")
+        if method not in ("empty", "integer"):
             flags.append(_make_flag(row_idx, soft_key, "mapped_modifier",
-                                    row.get(soft_key), f"Mapped soft story via {methods.get('soft_story')} → {result['soft_story_desc']}"))
+                                    row.get(soft_key),
+                                    f"Mapped soft story via {method} "
+                                    f"→ {result['soft_story_desc']}"))
 
     return row, flags
 
@@ -796,7 +848,7 @@ def _normalize_location_name(row: dict, row_idx: int,
     
     # Rule 2: Fallback if None
     if raw is None or str(raw).strip() == "":
-        contract_key = "ContractID" if target == "AIR" else "ACCNTNUM"
+        contract_key = "PolicyID" if target == "AIR" else "ACCNTNUM"
         fallback = (row.get(contract_key) or 
                     row.get("AccountName") or 
                     row.get("SubmissionName") or 
@@ -834,45 +886,51 @@ def _normalize_location_name(row: dict, row_idx: int,
 def _normalize_identity_fields(
     rows: List[Dict],
     target_format: str,
+    rules: BusinessRulesConfig
 ) -> Tuple[List[Dict], List[dict]]:
     """
     Bulk post-pass that enforces two rules:
 
-    1. ContractID (AIR) / ACCNTNUM (RMS) — uniform value across all rows.
-       The column_mapper has already resolved source aliases (e.g. "Policy Number"
-       → ContractID) before reaching here, so we simply scan for the first
-       non-blank value in the canonical key and propagate it to every row.
+    1. PolicyID (AIR) / ACCNTNUM (RMS) — uniform value across all rows.
+       If provided globally in rules, that is applied. Else, fallback to first non-empty.
 
     2. LocationID (AIR) / LOCNUM (RMS) — serial 1-based integer per policy group.
-       Rows are grouped by ContractID/ACCNTNUM; within each group they receive
+       Rows are grouped by PolicyID/ACCNTNUM; within each group they receive
        sequential numbers 1, 2, 3 … in the order they appear.
        Single-policy SOV files get a simple 1-to-N across all rows.
     """
     from collections import defaultdict
 
-    contract_key = "ContractID" if target_format == "AIR" else "ACCNTNUM"
+    contract_key = "PolicyID" if target_format == "AIR" else "ACCNTNUM"
     location_key = "LocationID" if target_format == "AIR" else "LOCNUM"
     flags: List[dict] = []
 
     # ── Step 1: resolve uniform policy ID ─────────────────────────────────────
-    # Scan for first non-blank value already under the canonical key.
-    policy_id: Optional[str] = None
-    for row in rows:
-        v = row.get(contract_key)
-        if v and str(v).strip():
-            policy_id = str(v).strip()
-            break
+    policy_id: Optional[str] = rules.policy_id if str(rules.policy_id).strip() else None
+
+    if not policy_id:
+        for row in rows:
+            v = row.get(contract_key)
+            if v and str(v).strip():
+                policy_id = str(v).strip()
+                break
 
     if not policy_id:
         for idx in range(len(rows)):
             flags.append(_make_flag(
                 idx, contract_key, "missing_policy_id", None,
                 f"{contract_key} is blank for all rows. "
-                f"Map a source column to '{contract_key}' in the column mapping step.",
+                f"Map a source column to '{contract_key}' or provide it globally.",
             ))
     else:
         for row in rows:
             row[contract_key] = policy_id
+
+    # ── Step 1.5: apply global insured name (AIR only) ────────────────────────
+    if target_format == "AIR" and str(rules.insured_name).strip():
+        for row in rows:
+            if not row.get("InsuredName"):
+                row["InsuredName"] = str(rules.insured_name).strip()
 
     # ── Step 2: serial location numbering ─────────────────────────────────────
     # Group row indexes by policy ID, then assign 1-based counters per group.
@@ -910,10 +968,7 @@ def normalize_all_rows(
     for idx, row in enumerate(rows):
         row = dict(row)  # work on a copy
 
-        row, f = _normalize_year(row, idx, rules_config, target_format)
-        all_flags.extend(f)
-
-        row, f = _normalize_upgraded_year(row, idx, rules_config, target_format)
+        row, f = _normalize_years(row, idx, rules_config, target_format)
         all_flags.extend(f)
 
         row, f = _normalize_stories(row, idx, rules_config, target_format)
@@ -943,7 +998,7 @@ def normalize_all_rows(
         normalized.append(row)
 
     # ── Bulk identity pass (runs after all per-row normalization) ───────────
-    normalized, id_flags = _normalize_identity_fields(normalized, target_format)
+    normalized, id_flags = _normalize_identity_fields(normalized, target_format, rules_config)
     all_flags.extend(id_flags)
 
     return normalized, all_flags

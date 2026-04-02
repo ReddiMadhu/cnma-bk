@@ -86,7 +86,8 @@ _iso_map: Dict[str, Dict] = {}              # iso_class_key → {air_class, alia
 _rms_to_air_map: Dict[str, Dict] = {}       # rms_code → {air_class, ...}
 _atc_to_air_map: Dict[str, Dict] = {}       # atc_class_str → {air_code, description, ...}
 _occ_raw_lookup: Dict[str, Dict] = {}       # normalized_raw_str → {air_code, atc, confidence}
-_occ_context_rules: Dict[str, Any] = {}     # term → {default, contexts[]}  
+_occ_context_rules: Dict[str, Any] = {}     # term → {default, contexts[]}
+_const_raw_lookup: Dict[str, Dict] = {}     # normalized_raw_str → {bldgclass, bldgscheme, final_category, confidence}
 
 _tfidf_indexes: Dict[str, Dict] = {}        # key: "air_occ", "air_const", "rms_occ", "rms_const"
 
@@ -176,11 +177,28 @@ MANDATORY CONFLICT RESOLUTION RULES (apply in this exact priority order):
   RULE 4 — FRAME GOVERNS: Structural frame (steel, concrete, wood, metal) beats
            non-structural elements: facade, veneer, infill, cladding, canopy, foundation
            Example: "Steel frame with masonry infill" → Steel Frame
+           Example: "Wood frame with brick siding/veneer" → Frame (wood primary, siding is cladding)
+           Example: "Wood framing with reinforced concrete foundation" → Frame (foundation not structural frame)
   RULE 5 — TILT-UP GOVERNS: Tilt-up concrete walls + any roof type → Masonry Non-Combustible
   RULE 6 — HEAVY TIMBER PRIMARY: Heavy timber structure + masonry secondary → Heavy Timber
   RULE 7 — UNKNOWN FRAME: Only facade material known, frame is unknown → Joisted Masonry (conservative)
   RULE 8 — INTERIOR PARTITION: Non-structural interior wood office/partition inside metal building
            does NOT trigger downgrade → primary governs
+
+CONSTRUCTION-SPECIFIC DISAMBIGUATION RULES:
+  CONST-1: "Frame" alone (no steel/concrete qualifier) → Wood Frame (RMS 1)
+           Wood/residential context always assumed when no explicit material stated
+  CONST-2: "Non-Combustible" / "NC" / "Non Comb" alone → ISO Fire Class 3 (FIRE/BLDGSCHEME=FIRE, BLDGCLASS=3)
+           Do NOT map to Masonry — Non-Combustible = Steel/Metal frame per ISO convention
+  CONST-3: "Wood Frame + [brick/masonry] Siding/Veneer/Cladding" → Frame/Wood (Rule 4: cladding not structural)
+  CONST-4: "Wood Frame + brick walls" (structural masonry walls) → Joisted Masonry
+  CONST-5: "Concrete podium" or "Frame over podium" → primary frame type governs; podium = foundation element
+           Example: "Frame over 2-story concrete podium" → Frame/Wood (RMS 1)
+  CONST-6: "Fire Resistive" / "FR" → FIRE class 6 (BLDGSCHEME=FIRE, BLDGCLASS=6)
+  CONST-7: "Modified Fire Resistive" / "MFR" → FIRE class 5 (BLDGSCHEME=FIRE, BLDGCLASS=5)
+  CONST-8: "Joisted Masonry" / "JM" → FIRE class 2 (BLDGSCHEME=FIRE, BLDGCLASS=2)
+  CONST-9: "Masonry Non-Combustible" / "MNC" → FIRE class 4 (BLDGSCHEME=FIRE, BLDGCLASS=4)
+  CONST-10: "Heavy Timber" / "HT" / "Glulam" → FIRE class 7 (BLDGSCHEME=FIRE, BLDGCLASS=7)
 
 IMPORTANT CONSTRAINTS:
   - Only output codes from the provided code list — NEVER invent or guess codes
@@ -262,7 +280,7 @@ def build_tfidf_indexes() -> None:
     logger.info(f"RMS const registry built from rms_to_air_const_map: {len(_rms_const_codes)} codes")
 
     # Load new reference maps
-    iso_data = load_json("iso_const_map.json")
+    iso_data = load_json("iso_fire_class_map.json")
     _iso_map = iso_data.get("iso_to_air", {})
 
     rms_air_data = load_json("rms_to_air_const_map.json")
@@ -280,6 +298,56 @@ def build_tfidf_indexes() -> None:
 
     ctx_data = load_json("occ_context_rules.json")
     _occ_context_rules.update(ctx_data.get("rules", {}))
+
+    # ── Load RMS construction raw-string lookup (English descriptions → scheme/class) ──
+    const_lookup_data = load_json("rms_const_string_lookup.json")
+    _const_raw_lookup.update(const_lookup_data.get("lookup", {}))
+    logger.info(f"RMS const raw-string lookup: {len(_const_raw_lookup)} entries loaded.")
+
+    # ── Inject keyword aliases into basic RMS construction codes ──────────────
+    # Basic RMS codes only carry their rms_desc as keyword (e.g. code 1 = "Wood").
+    # We inject English synonym aliases so the deterministic scorer can directly
+    # match common inputs like "frame", "non-combustible", "steel", etc.
+    _RMS_CONST_KEYWORD_ALIASES: Dict[str, list] = {
+        "0":  ["unknown", "unspecified", "tbd", "unclassified"],
+        "1":  ["wood", "frame", "wood frame", "stick frame", "timber frame",
+               "light frame", "light wood frame", "post frame", "pole barn",
+               "adobe", "sip", "structural insulated panel", "modular wood"],
+        "2":  ["masonry", "brick", "cmu", "block", "joisted masonry", "jm",
+               "unreinforced masonry", "urm", "stone masonry", "concrete block",
+               "masonry bearing", "brick masonry"],
+        "3":  ["reinforced concrete", "concrete", "rc", "cast in place",
+               "cip", "post tension", "flat slab", "waffle slab",
+               "prestressed concrete", "concrete frame", "shear wall",
+               "concrete shear wall"],
+        "4":  ["steel", "steel frame", "structural steel", "metal frame",
+               "light gauge steel", "lgs", "steel stud", "steel joist",
+               "braced frame", "moment frame", "steel deck"],
+        "5":  ["mobile home", "manufactured home", "trailer"],
+        "2B": ["unreinforced masonry", "urm", "unconfined masonry", "plain masonry"],
+        "2C": ["structural masonry", "reinforced masonry", "rm brick"],
+        "2C1":["reinforced masonry shear wall", "rm shear wall"],
+        "3A": ["cast in place concrete", "cip concrete", "rc concrete roof"],
+        "3A1":["rc moment resisting frame", "rcmrf", "concrete moment frame"],
+        "3A2":["rc mrf with shear walls", "concrete dual system"],
+        "3A4":["rc shear wall", "concrete shear wall"],
+        "3B": ["precast concrete", "precast", "pre-cast", "precast panel",
+               "hollow core", "double tee", "prefab concrete"],
+        "3B4":["tilt-up", "tilt up", "tilt wall", "tilt panel", "tiltup"],
+        "4A": ["steel frame concrete roof", "steel concrete"],
+        "4A1":["steel mrf", "steel moment resisting frame", "smrf"],
+        "4A4":["concentrically braced frame", "cbf", "braced steel frame"],
+        "4B": ["light metal frame", "light metal", "metal building",
+               "pre-engineered metal", "pemb", "metal bldg"],
+        "4C": ["steel frame wood roof", "steel frame metal roof"],
+        "5A": ["mobile home without tie downs", "manufactured home no tie down"],
+        "5B": ["mobile home with tie downs", "manufactured home tie down"],
+    }
+    for code, aliases in _RMS_CONST_KEYWORD_ALIASES.items():
+        if code in _rms_const_codes:
+            existing = _rms_const_codes[code].get("keywords", [])
+            _rms_const_codes[code]["keywords"] = list(dict.fromkeys(existing + aliases))
+    logger.info("RMS const keyword aliases injected.")
 
     logger.info(
         f"Occupancy maps ready: {len(_atc_to_air_map)} ATC classes, "
@@ -387,6 +455,33 @@ def _lookup_raw_occ_string(raw: str) -> Optional[Dict]:
     return _occ_raw_lookup.get(normalized)
 
 
+def _lookup_raw_const_string(raw: str) -> Optional[Dict]:
+    """
+    Pre-deterministic raw string lookup for RMS construction descriptions.
+    Returns {bldgclass, bldgscheme, final_category, confidence} or None.
+    Tries full match first, then progressive prefix shortening for compound inputs.
+    """
+    normalized = re.sub(r'\s+', ' ', raw.lower().strip())
+    # 1. Full exact match
+    hit = _const_raw_lookup.get(normalized)
+    if hit:
+        return hit
+    # 2. Strip trailing parentheticals e.g. "wood frame (apartments)" → "wood frame"
+    stripped = re.sub(r'\s*\([^)]*\)\s*$', '', normalized).strip()
+    if stripped != normalized:
+        hit = _const_raw_lookup.get(stripped)
+        if hit:
+            return hit
+    # 3. Slash-split: "wood frame / brick siding" → try each part
+    if '/' in normalized:
+        parts = [p.strip() for p in normalized.split('/')]
+        for part in parts:
+            hit = _const_raw_lookup.get(part)
+            if hit:
+                return hit
+    return None
+
+
 def _resolve_occ_context(raw: str, context_row: Dict) -> Optional[Dict]:
     """
     Apply context-aware disambiguation rules for ambiguous occupancy terms.
@@ -441,13 +536,19 @@ def _lookup_iso(value: str) -> Optional[Dict]:
     stripped = value.strip().upper()
     # Direct key lookup
     if stripped in _iso_map:
-        return _iso_map[stripped]
+        d = dict(_iso_map[stripped])
+        d["iso_key"] = stripped
+        d["isf_code"] = d.get("isf_class")  # From iso_fire_class_map.json
+        return d
     # Search aliases
     numeric_key = stripped if stripped.isdigit() else None
     for key, data in _iso_map.items():
         aliases = [a.upper() for a in data.get("aliases", [])]
         if stripped in aliases or (numeric_key and key == numeric_key):
-            return data
+            d = dict(data)
+            d["iso_key"] = key
+            d["isf_code"] = d.get("isf_class")
+            return d
     return None
 
 
@@ -685,19 +786,36 @@ def _node_iso_direct(state: CodeMappingState) -> CodeMappingState:
 
         iso_data = _lookup_iso(raw_value)
         if iso_data:
-            air_code = iso_data["air_class"]
+            if state["target"] == "AIR":
+                # User wants Frame (Class 1) to remain "AIR 101".
+                # For all other ISO-based matches, use the "ISF" schema.
+                iso_key = iso_data.get("iso_key")
+                if iso_key == "1" or iso_data.get("air_class") == "101":
+                    out_code = "101"
+                    scheme_ov = None
+                elif iso_data.get("isf_code"):
+                    out_code = iso_data["isf_code"]
+                    scheme_ov = "ISF"
+                else:
+                    out_code = iso_data["air_class"]
+                    scheme_ov = None
+            else:
+                out_code = iso_data["iso_key"]
+                scheme_ov = "FIRE"
+                
             results[str(idx)] = {
-                "code": air_code,
+                "code": out_code,
                 "confidence": 1.0,
                 "description": iso_data.get("description", ""),
                 "method": "iso_direct",
                 "original": raw_value,
                 "alternatives": [],
-                "reasoning": f"ISO Fire Class '{raw_value}' ({iso_data.get('iso_label', '')}) → AIR {air_code}",
+                "reasoning": f"ISO Fire Class '{raw_value}' ({iso_data.get('iso_label', '')}) → {out_code}",
                 "abbreviation_expanded": False,
                 "iso_class": raw_value,
+                "scheme_override": scheme_ov,
             }
-            logger.debug(f"ISO direct: item {idx} '{raw_value}' → AIR {air_code}")
+            logger.debug(f"ISO direct: item {idx} '{raw_value}' → {out_code} ({scheme_ov if scheme_ov else 'AIR'})")
         else:
             # Unknown ISO value — fall through
             pending_rms_direct.append(idx)
@@ -742,18 +860,29 @@ def _node_rms_direct(state: CodeMappingState) -> CodeMappingState:
 
         rms_mapping = _lookup_rms_to_air(raw_value)
         if rms_mapping:
-            air_code = rms_mapping["air_class"]
+            out_code = rms_mapping["air_class"]
+            final_scheme = None
+
+            # User wants Non-Frame ISO classes (2-6) to use ISF schema in AIR mode.
+            # RMS codes 1-6 map directly to ISO 1-6.
+            if raw_value in {"2", "3", "4", "5", "6"}:
+                iso_meta = _lookup_iso(raw_value)
+                if iso_meta and iso_meta.get("isf_code"):
+                    out_code = iso_meta["isf_code"]
+                    final_scheme = "ISF"
+
             results[str(idx)] = {
-                "code": air_code,
+                "code": out_code,
                 "confidence": 0.98,
                 "description": rms_mapping.get("air_desc", ""),
                 "method": "rms_direct",
                 "original": raw_value,
                 "alternatives": [],
-                "reasoning": f"RMS construction code '{raw_value}' ({rms_mapping.get('rms_desc', '')}) → AIR {air_code} via cross-translation table",
+                "reasoning": f"RMS construction code '{raw_value}' ({rms_mapping.get('rms_desc', '')}) → {out_code} (scheme={final_scheme or 'AIR'}) via cross-translation table",
                 "abbreviation_expanded": False,
+                "scheme_override": final_scheme,
             }
-            logger.debug(f"RMS direct (construction): item {idx} '{raw_value}' → AIR {air_code}")
+            logger.debug(f"RMS direct (construction): item {idx} '{raw_value}' → {out_code} ({final_scheme or 'AIR'})")
         else:
             pending_conflict.append(idx)
 
@@ -795,10 +924,20 @@ def _node_conflict(state: CodeMappingState) -> CodeMappingState:
         if conflict_result and conflict_result.confidence >= threshold:
             # High confidence → use directly, skip deterministic
             if state["target"] == "AIR":
-                code = conflict_result.air_code
-                desc = _const_codes.get(code, {}).get("description", conflict_result.final_category)
+                out_code = conflict_result.air_code
+                final_scheme = None
+                
+                # Check for ISF schema preference (excluding Frame/Class 1)
+                iso_cls = str(conflict_result.iso_class or "")
+                if iso_cls and iso_cls != "1":
+                    iso_meta = _lookup_iso(iso_cls)
+                    if iso_meta and iso_meta.get("isf_code"):
+                        out_code = iso_meta["isf_code"]
+                        final_scheme = "ISF"
+
+                desc = _const_codes.get(out_code, {}).get("description", conflict_result.final_category)
                 results[str(idx)] = {
-                    "code": code,
+                    "code": out_code,
                     "confidence": conflict_result.confidence,
                     "description": desc,
                     "method": "conflict_rule",
@@ -808,6 +947,7 @@ def _node_conflict(state: CodeMappingState) -> CodeMappingState:
                     "abbreviation_expanded": was_expanded,
                     "conflict_flag": conflict_result.conflict_flag,
                     "rule_applied": conflict_result.rule_applied,
+                    "scheme_override": final_scheme,
                 }
             else:
                 # For RMS target: conflict resolver returns an AIR code, but we need
@@ -897,6 +1037,73 @@ def _node_deterministic(state: CodeMappingState) -> CodeMappingState:
                     if ctx_result["confidence"] < threshold:
                         new_pending_llm.append(idx)
                     continue
+
+        # ── Construction: raw-string lookup (pre-scoring) ─────────────────────
+        # This fires for BOTH target=RMS and target=AIR (construction field).
+        # Returns {bldgclass, bldgscheme, final_category, confidence}.
+        if state["field"] == "construction":
+            const_hit = _lookup_raw_const_string(raw_value)
+            if not const_hit:
+                const_hit = _lookup_raw_const_string(expanded)
+            if const_hit:
+                hit_conf = const_hit["confidence"]
+                bldgclass = const_hit["bldgclass"]
+                bldgscheme = const_hit["bldgscheme"]
+                final_cat = const_hit.get("final_category", "")
+                
+                out_code = bldgclass
+                final_scheme = bldgscheme
+
+                if state["target"] == "AIR":
+                    if bldgscheme == "RMS":
+                        mapped = _lookup_rms_to_air(bldgclass)
+                        if mapped:
+                            # User wants Frame (Class 1) to remain "AIR 101".
+                            # For all other RMS->ISO mappings, prefer ISF code.
+                            if bldgclass == "1":
+                                out_code = "101"
+                                final_scheme = None
+                            else:
+                                iso_meta = _lookup_iso(bldgclass)
+                                if iso_meta and iso_meta.get("isf_code"):
+                                    out_code = iso_meta["isf_code"]
+                                    final_scheme = "ISF"
+                                else:
+                                    out_code = mapped["air_class"]
+                                    final_scheme = None 
+                    elif bldgscheme == "FIRE":
+                        # User wants Frame (Class 1) to remain "AIR 101".
+                        if bldgclass == "1":
+                            out_code = "101"
+                            final_scheme = None
+                        else:
+                            mapped = _lookup_iso(bldgclass)
+                            if mapped:
+                                if mapped.get("isf_code"):
+                                    out_code = mapped["isf_code"]
+                                    final_scheme = "ISF"
+                                else:
+                                    out_code = mapped["air_class"]
+                                    final_scheme = None
+
+                results[str(idx)] = {
+                    "code": out_code,
+                    "confidence": hit_conf,
+                    "description": final_cat,
+                    "method": "rule",
+                    "original": raw_value,
+                    "alternatives": [],
+                    "reasoning": f"Construction raw-string lookup: '{raw_value}' → {final_cat} (scheme={final_scheme or 'AIR'}, class={out_code})",
+                    "abbreviation_expanded": was_expanded,
+                    "scheme_override": final_scheme,
+                }
+                logger.debug(
+                    f"const_raw_lookup hit: idx={idx} '{raw_value}' → "
+                    f"{final_cat} BLDGSCHEME={bldgscheme} BLDGCLASS={bldgclass} conf={hit_conf:.2f}"
+                )
+                if hit_conf < threshold:
+                    new_pending_llm.append(idx)
+                continue
         # ────────────────────────────────────────────────────────────────────
 
         best_code, confidence, best_meta, alts = _deterministic_classify(
@@ -1149,8 +1356,18 @@ def _node_tfidf(state: CodeMappingState) -> CodeMappingState:
                     })
 
             description = registry.get(best_code, {}).get("description", "")
+            
+            # Apply ISF schema preference for AIR targets in TF-IDF results
+            out_code = best_code
+            final_scheme = None
+            if state["target"] == "AIR" and state["field"] == "construction":
+                # For non-combustible (152), map to ISF 3.
+                if out_code == "152":
+                    out_code = "3"
+                    final_scheme = "ISF"
+            
             results[str(idx)] = {
-                "code": best_code,
+                "code": out_code,
                 "confidence": confidence,
                 "description": description,
                 "method": "tfidf",
@@ -1158,6 +1375,7 @@ def _node_tfidf(state: CodeMappingState) -> CodeMappingState:
                 "alternatives": alts,
                 "reasoning": f"TF-IDF cosine similarity: {best_sim:.3f}",
                 "abbreviation_expanded": was_expanded,
+                "scheme_override": final_scheme,
             }
 
             if confidence < tfidf_threshold:

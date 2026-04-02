@@ -21,13 +21,15 @@ class UploadResponse(BaseModel):
 class ColumnSuggestion(BaseModel):
     canonical: str
     score: float
-    method: Literal["fuzzy", "llm"]
+    method: Literal["fuzzy", "llm", "memory"]
     reason: Optional[str] = None
+    count: Optional[int] = None   # number of confirmed sessions (memory only)
 
 
 class SuggestColumnsResponse(BaseModel):
     suggestions: Dict[str, List[ColumnSuggestion]]
     unmapped: List[str]
+    memory_count: int = 0   # number of columns resolved from learned memory
 
 
 class ConfirmColumnsRequest(BaseModel):

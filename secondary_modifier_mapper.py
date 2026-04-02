@@ -1,33 +1,48 @@
 """
 secondary_modifier_mapper.py
 ----------------------------
-Lightweight standalone mapper for AIR/RMS secondary modifier fields:
-  - roof_cover    (codes 0-11, shared AIR/RMS)
-  - wall_type     (codes 0-9,  shared AIR/RMS)
-  - foundation_type (codes 0-12, shared AIR/RMS)
-  - soft_story    (codes 0-2,  shared AIR/RMS)
+Lightweight standalone mapper for AIR and RMS secondary modifier fields.
 
-Key fact: AIR (Touchstone) and RMS use IDENTICAL integer codes for all four
-secondary modifiers. No cross-scheme translation needed.
+Field breakdown by vendor:
+  AIR (Touchstone):
+    - roof_cover      (codes 0-11)  — AIR RoofCover field
+    - wall_type       (codes 0-9)   — AIR WallType / WallSiding field
+    - foundation_type (codes 0-12)  — shared with RMS, identical codes
+    - soft_story      (codes 0-2)   — shared with RMS, identical codes
+
+  RMS (Touchstone NA):
+    - rms_roofsys     (codes 0-9)   — RMS Roofsys field (different scale than AIR)
+    - rms_cladsys     (codes 0-10)  — RMS CLADSYS cladding field (different schema than AIR)
+    - foundation_type (codes 0-12)  — shared with AIR, identical codes
+    - soft_story      (codes 0-2)   — shared with AIR, identical codes
+
+IMPORTANT: wall_type and rms_cladsys are NOT interchangeable.
+           roof_cover and rms_roofsys are NOT interchangeable.
+           Always use the correct field for the pipeline target (AIR vs RMS).
 
 Usage:
     from secondary_modifier_mapper import SecondaryModifierMapper
 
     mapper = SecondaryModifierMapper()
 
-    # Single field
-    code = mapper.map_roof_cover("clay tile")        # -> 3
-    code = mapper.map_foundation_type("slab")        # -> 8
-    code = mapper.map_soft_story("yes")              # -> 2
+    # AIR fields
+    code = mapper.map_roof_cover("clay tile")           # -> 3
+    code = mapper.map_wall_type("plywood")              # -> 3
+    code = mapper.map_foundation_type("slab")           # -> 8
+    code = mapper.map_soft_story("yes")                 # -> 2
 
-    # All fields at once from a row dict
+    # RMS fields
+    code = mapper.map_rms_roofsys("composition shingles")  # -> 8
+    code = mapper.map_rms_cladsys("brick veneer")           # -> 1
+
+    # All AIR fields at once from a row dict
     result = mapper.map_all({
         "roof_cover":      "TPO membrane",
-        "wall_type":       "brick veneer",
+        "wall_type":       "cast in place concrete",
         "foundation_type": "pile",
         "soft_story":      "no",
     })
-    # -> {"roof_cover": 7, "wall_type": 7, "foundation_type": 9, "soft_story": 1,
+    # -> {"roof_cover": 7, "wall_type": 8, "foundation_type": 9, "soft_story": 1,
     #     "roof_cover_desc": "Single ply membrane", ...}
 """
 
@@ -76,11 +91,13 @@ def _normalize(raw: str) -> str:
 
 
 def _is_valid_int(val: str, lo: int, hi: int) -> Optional[int]:
-    """Return int if val is an integer string in [lo, hi], else None."""
+    """Return int if val represents an integer in [lo, hi], else None. Handles cases like '1.0' from pandas NaN float casting."""
     try:
-        i = int(val.strip())
-        if lo <= i <= hi:
-            return i
+        f = float(val.strip())
+        if f.is_integer():
+            i = int(f)
+            if lo <= i <= hi:
+                return i
     except (ValueError, TypeError):
         pass
     return None
@@ -118,7 +135,7 @@ def _lookup(
     normalized = _normalize(raw)
 
     # ── Stage 1: Integer pass-through ──────────────────────────────────────
-    maybe_int = _is_valid_int(normalized, lo, hi)
+    maybe_int = _is_valid_int(original, lo, hi)
     if maybe_int is not None:
         return {
             "code":        maybe_int,
@@ -156,8 +173,9 @@ def _lookup(
             "original":    original,
         }
 
-    # ── Stage 4: LLM fallback (roof_cover and foundation_type only) ─────────
-    if use_llm and field in {"roof_cover", "foundation_type"} and llm_client:
+    # ── Stage 4: LLM fallback (ambiguous fields only) ────────────────────────
+    _llm_eligible_fields = {"roof_cover", "foundation_type", "rms_roofsys", "rms_cladsys"}
+    if use_llm and field in _llm_eligible_fields and llm_client:
         llm_code = _llm_classify(normalized, field, codes, llm_client)
         if llm_code is not None:
             return {
@@ -220,12 +238,18 @@ def _llm_classify(
 
 class SecondaryModifierMapper:
     """
-    Lightweight mapper for AIR/RMS secondary modifier fields.
+    Lightweight mapper for AIR and RMS secondary modifier fields.
 
-    AIR and RMS share IDENTICAL integer codes for:
-      roof_cover (0-11), wall_type (0-9), foundation_type (0-12), soft_story (0-2)
+    AIR-specific fields (use for AIR target):
+      roof_cover (0-11), wall_type (0-9)
 
-    The mapper normalises raw text → canonical integer in three stages:
+    RMS-specific fields (use for RMS target):
+      rms_roofsys (0-9), rms_cladsys (0-10)
+
+    Shared fields — identical codes for both AIR and RMS:
+      foundation_type (0-12), soft_story (0-2)
+
+    The mapper normalises raw text → canonical integer in four stages:
       1. Integer pass-through   (fastest — already a code)
       2. Exact alias dict       (O(1) lookup, 200+ entries)
       3. Keyword token scan     (longest-match substring)
@@ -237,7 +261,13 @@ class SecondaryModifierMapper:
         llm_client: Pre-built google.genai client. Auto-created if None and use_llm=True.
     """
 
-    FIELDS = ("roof_cover", "wall_type", "foundation_type", "soft_story")
+    # AIR-target fields
+    AIR_FIELDS = ("roof_cover", "wall_type", "foundation_type", "soft_story")
+    # RMS-target fields
+    RMS_FIELDS = ("rms_roofsys", "rms_cladsys", "foundation_type", "soft_story")
+    # All known fields (union)
+    FIELDS = ("roof_cover", "wall_type", "foundation_type", "soft_story",
+              "rms_roofsys", "rms_cladsys")
 
     def __init__(self, use_llm: bool = True, llm_client=None):
         # Warm the reference data cache
@@ -259,23 +289,33 @@ class SecondaryModifierMapper:
                 else:
                     logger.debug("GEMINI_API_KEY not set. LLM stage disabled.")
 
-    # ── Per-field convenience methods ────────────────────────────────────────
+    # ── AIR per-field convenience methods ────────────────────────────────────
 
     def map_roof_cover(self, raw: str) -> int:
-        """Map raw roof cover description → code 0-11."""
+        """Map raw roof cover description → AIR RoofCover code 0-11."""
         return self._map("roof_cover", raw)["code"]
 
     def map_wall_type(self, raw: str) -> int:
-        """Map raw wall type description → code 0-9."""
+        """Map raw wall type description → AIR WallType code 0-9."""
         return self._map("wall_type", raw)["code"]
 
     def map_foundation_type(self, raw: str) -> int:
-        """Map raw foundation type description → code 0-12."""
+        """Map raw foundation type description → code 0-12 (shared AIR/RMS)."""
         return self._map("foundation_type", raw)["code"]
 
     def map_soft_story(self, raw: str) -> int:
-        """Map raw soft story indicator → code 0-2."""
+        """Map raw soft story indicator → code 0-2 (shared AIR/RMS)."""
         return self._map("soft_story", raw)["code"]
+
+    # ── RMS per-field convenience methods ────────────────────────────────────
+
+    def map_rms_roofsys(self, raw: str) -> int:
+        """Map raw roof description → RMS Roofsys code 0-9 (NOT same as AIR roof_cover)."""
+        return self._map("rms_roofsys", raw)["code"]
+
+    def map_rms_cladsys(self, raw: str) -> int:
+        """Map raw cladding description → RMS CLADSYS code 0-10 (NOT same as AIR wall_type)."""
+        return self._map("rms_cladsys", raw)["code"]
 
     # ── Full detail (code + description + confidence + method) ───────────────
 
@@ -291,11 +331,17 @@ class SecondaryModifierMapper:
     def map_soft_story_detail(self, raw: str) -> Dict[str, Any]:
         return self._map("soft_story", raw)
 
-    # ── Batch: map all 4 fields from a row dict ────────────────────────────
+    def map_rms_roofsys_detail(self, raw: str) -> Dict[str, Any]:
+        return self._map("rms_roofsys", raw)
+
+    def map_rms_cladsys_detail(self, raw: str) -> Dict[str, Any]:
+        return self._map("rms_cladsys", raw)
+
+    # ── Batch: map all 4 AIR fields from a row dict ──────────────────────────
 
     def map_all(self, row: Dict[str, str]) -> Dict[str, Any]:
         """
-        Map all secondary modifier fields from a row dict.
+        Map all AIR secondary modifier fields from a row dict.
 
         Args:
             row: dict with any subset of keys:
@@ -305,10 +351,10 @@ class SecondaryModifierMapper:
         Returns:
             Flat dict with integer codes AND descriptions:
             {
-              "roof_cover": 7,       "roof_cover_desc": "Single ply membrane",
-              "wall_type":  2,       "wall_type_desc": "Masonry",
-              "foundation_type": 8,  "foundation_type_desc": "Mat / slab",
-              "soft_story": 1,       "soft_story_desc": "No",
+              "roof_cover": 7,          "roof_cover_desc": "Single ply membrane",
+              "wall_type":  8,          "wall_type_desc": "Cast-in-place concrete",
+              "foundation_type": 8,     "foundation_type_desc": "Mat / slab",
+              "soft_story": 1,          "soft_story_desc": "No",
               "_methods": {"roof_cover": "alias", ...},
               "_confidence": {"roof_cover": 0.97, ...},
             }
@@ -317,7 +363,7 @@ class SecondaryModifierMapper:
         methods: Dict[str, str] = {}
         confidence: Dict[str, float] = {}
 
-        for field in self.FIELDS:
+        for field in self.AIR_FIELDS:
             raw_val = str(row.get(field) or "").strip()
             if not raw_val:
                 raw_val = "0"  # treat missing as Unknown
@@ -327,6 +373,60 @@ class SecondaryModifierMapper:
             result[f"{field}_desc"]   = detail["description"]
             methods[field]            = detail["method"]
             confidence[field]         = detail["confidence"]
+
+        result["_methods"]    = methods
+        result["_confidence"] = confidence
+        return result
+
+    def map_all_rms(self, row: Dict[str, str]) -> Dict[str, Any]:
+        """
+        Map all RMS secondary modifier fields from a row dict.
+
+        Args:
+            row: dict with any subset of keys:
+                 "roof_cover" (mapped to rms_roofsys),
+                 "wall_type"  (mapped to rms_cladsys),
+                 "foundation_type", "soft_story"
+                 Values can be raw text or already integer strings.
+
+        Returns:
+            Flat dict with integer codes AND descriptions (using RMS schemas):
+            {
+              "rms_roofsys": 8,       "rms_roofsys_desc": "Composition/FG/Asphalt Shingles",
+              "rms_cladsys": 1,       "rms_cladsys_desc": "Brick veneer",
+              "foundation_type": 8,   "foundation_type_desc": "Mat / slab",
+              "soft_story": 1,        "soft_story_desc": "No",
+              "_methods": {...}, "_confidence": {...}
+            }
+        """
+        result: Dict[str, Any] = {}
+        methods: Dict[str, str] = {}
+        confidence: Dict[str, float] = {}
+
+        # Roof: input key is "roof_cover", RMS schema is "rms_roofsys"
+        roof_raw = str(row.get("roof_cover") or "").strip() or "0"
+        roof_detail = self._map("rms_roofsys", roof_raw)
+        result["rms_roofsys"]       = roof_detail["code"]
+        result["rms_roofsys_desc"]  = roof_detail["description"]
+        methods["rms_roofsys"]      = roof_detail["method"]
+        confidence["rms_roofsys"]   = roof_detail["confidence"]
+
+        # Wall: input key is "wall_type", RMS schema is "rms_cladsys"
+        wall_raw = str(row.get("wall_type") or "").strip() or "0"
+        wall_detail = self._map("rms_cladsys", wall_raw)
+        result["rms_cladsys"]       = wall_detail["code"]
+        result["rms_cladsys_desc"]  = wall_detail["description"]
+        methods["rms_cladsys"]      = wall_detail["method"]
+        confidence["rms_cladsys"]   = wall_detail["confidence"]
+
+        # Shared fields
+        for field in ("foundation_type", "soft_story"):
+            raw_val = str(row.get(field) or "").strip() or "0"
+            detail = self._map(field, raw_val)
+            result[field]           = detail["code"]
+            result[f"{field}_desc"] = detail["description"]
+            methods[field]          = detail["method"]
+            confidence[field]       = detail["confidence"]
 
         result["_methods"]    = methods
         result["_confidence"] = confidence
@@ -349,6 +449,8 @@ class SecondaryModifierMapper:
     def _map(self, field: str, raw: str) -> Dict[str, Any]:
         if field not in self.FIELDS:
             raise ValueError(f"Unknown field '{field}'. Valid: {self.FIELDS}")
+        # LLM fallback for RMS fields mirrors AIR equivalents
+        _llm_eligible = {"roof_cover", "foundation_type", "rms_roofsys", "rms_cladsys"}
         if not raw or not raw.strip():
             spec = _ref()[field]
             return {
@@ -389,35 +491,75 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     mapper = SecondaryModifierMapper(use_llm=False)
-    tests = [
-        ("roof_cover",     "asphalt shingles"),
-        ("roof_cover",     "clay tile"),
-        ("roof_cover",     "TPO"),
-        ("roof_cover",     "standing seam metal"),
-        ("roof_cover",     "3"),        # integer pass-through
-        ("wall_type",      "brick veneer"),
-        ("wall_type",      "stucco"),
-        ("wall_type",      "HardiePlank"),
-        ("foundation_type","slab on grade"),
-        ("foundation_type","pile foundation"),
-        ("foundation_type","cripple wall"),
-        ("soft_story",     "yes"),
-        ("soft_story",     "no"),
-        ("soft_story",     "unknown"),
+
+    # ── AIR field tests ────────────────────────────────────────────────────────
+    air_tests = [
+        ("roof_cover",      "asphalt shingles"),
+        ("roof_cover",      "clay tile"),
+        ("roof_cover",      "TPO"),
+        ("roof_cover",      "standing seam metal"),
+        ("roof_cover",      "3"),            # integer pass-through
+        ("wall_type",       "brick"),        # -> 1 Brick/unreinforced masonry
+        ("wall_type",       "reinforced masonry"),  # -> 2
+        ("wall_type",       "plywood"),      # -> 3
+        ("wall_type",       "osb"),          # -> 5 Particle board/OSB
+        ("wall_type",       "metal panels"), # -> 6
+        ("wall_type",       "cast in place"),# -> 8 Cast-in-place concrete
+        ("wall_type",       "gypsum board"), # -> 9
+        ("foundation_type", "slab on grade"),
+        ("foundation_type", "pile foundation"),
+        ("foundation_type", "cripple wall"),
+        ("soft_story",      "yes"),
+        ("soft_story",      "no"),
+        ("soft_story",      "unknown"),
     ]
-    print("=== SecondaryModifierMapper smoke test ===\n")
-    for field, raw in tests:
+    print("=== SecondaryModifierMapper smoke test -- AIR fields ===\n")
+    for field, raw in air_tests:
         detail = mapper._map(field, raw)
         print(f"{field:20s}  '{raw:30s}'  -> {detail['code']:2d}  "
-              f"({detail['description'][:30]})  [{detail['method']}, {detail['confidence']:.2f}]")
+              f"({detail['description'][:35]})  [{detail['method']}, {detail['confidence']:.2f}]")
 
-    print("\n--- map_all() ---")
-    row = {
+    # ── RMS field tests ────────────────────────────────────────────────────────
+    rms_tests = [
+        ("rms_roofsys", "slate"),               # -> 1
+        ("rms_roofsys", "single ply membrane"), # -> 3
+        ("rms_roofsys", "composition shingles"),# -> 8
+        ("rms_roofsys", "clay tiles"),          # -> 6
+        ("rms_roofsys", "wood shingles"),       # -> 7
+        ("rms_roofsys", "swr"),                 # -> 9
+        ("rms_cladsys", "brick veneer"),        # -> 1
+        ("rms_cladsys", "metal sheathing"),     # -> 2
+        ("rms_cladsys", "eifs"),                # -> 4
+        ("rms_cladsys", "vinyl siding"),        # -> 8
+        ("rms_cladsys", "stucco"),              # -> 9
+    ]
+    print("\n=== SecondaryModifierMapper smoke test -- RMS fields ===\n")
+    for field, raw in rms_tests:
+        detail = mapper._map(field, raw)
+        print(f"{field:20s}  '{raw:30s}'  -> {detail['code']:2d}  "
+              f"({detail['description'][:55]})  [{detail['method']}, {detail['confidence']:.2f}]")
+
+    # ── map_all() AIR ──────────────────────────────────────────────────────────
+    print("\n--- map_all() AIR ---")
+    air_row = {
         "roof_cover":       "TPO membrane",
+        "wall_type":        "cast in place concrete",
+        "foundation_type":  "slab",
+        "soft_story":       "no",
+    }
+    result = mapper.map_all(air_row)
+    for field in mapper.AIR_FIELDS:
+        print(f"  {field}: {result[field]} ({result[field+'_desc']})  [{result['_methods'][field]}]")
+
+    # ── map_all_rms() RMS ──────────────────────────────────────────────────────
+    print("\n--- map_all_rms() RMS ---")
+    rms_row = {
+        "roof_cover":       "composition shingles",
         "wall_type":        "brick veneer",
         "foundation_type":  "slab",
         "soft_story":       "no",
     }
-    result = mapper.map_all(row)
-    for field in mapper.FIELDS:
-        print(f"  {field}: {result[field]} ({result[field+'_desc']})  [{result['_methods'][field]}]")
+    rms_result = mapper.map_all_rms(rms_row)
+    for field in ("rms_roofsys", "rms_cladsys", "foundation_type", "soft_story"):
+        print(f"  {field}: {rms_result[field]} ({rms_result[field+'_desc']})  [{rms_result['_methods'][field]}]")
+

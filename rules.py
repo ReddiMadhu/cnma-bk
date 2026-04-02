@@ -14,8 +14,10 @@ class BusinessRulesConfig(BaseModel):
     invalid_year_action: Literal["none", "reset_year", "set_default", "flag_review"] = "flag_review"
     year_default: int = 1980
 
-    # ── Default Line of Business ───────────────────────────────────────────────
+    # ── Global overrides ───────────────────────────────────────────────
     line_of_business: str = ""
+    policy_id: str = ""
+    insured_name: str = ""
 
 
     # ── Stories ────────────────────────────────────────────────────────────────

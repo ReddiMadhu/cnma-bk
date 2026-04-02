@@ -82,7 +82,8 @@ def assemble_address(row: dict, target_format: str = "AIR") -> Optional[str]:
         parts = [
             val("Street"),
             val("City"),
-            val("Area"),
+            val("County"),
+            val("Area", "State"),
             val("PostalCode"),
             val("CountryISO"),
         ]
@@ -90,6 +91,7 @@ def assemble_address(row: dict, target_format: str = "AIR") -> Optional[str]:
         parts = [
             val("STREETNAME"),
             val("CITY"),
+            val("COUNTY"),
             val("STATECODE"),
             val("POSTALCODE"),
             val("CNTRYCODE"),
@@ -117,6 +119,7 @@ def geocode_address(normalized_address: str) -> dict:
         "text": normalized_address,
         "format": "json",
         "limit": 1,
+        "lang": "en",
         "apiKey": GEOAPIFY_API_KEY,
     }
 
@@ -145,6 +148,12 @@ def geocode_address(normalized_address: str) -> dict:
     r = results[0]
     state_name = r.get("state", "")
     state_code = _resolve_state_code(state_name)
+
+    # Fallback to ISO-3166-2 for state code (e.g. "DE-BE" -> "BE") if primary state_name missing
+    iso2 = r.get("iso3166_2", "")
+    if not state_code and iso2 and "-" in iso2:
+        state_code = iso2.split("-")[-1].upper()
+
     country_raw = (r.get("country_code") or "").strip()
     country_iso = _resolve_country_alpha2(country_raw)
 
@@ -170,6 +179,35 @@ def _join_street(r: dict) -> str:
     housenumber = r.get("housenumber", "") or ""
     street = r.get("street", "") or ""
     return f"{housenumber} {street}".strip()
+
+
+def _clean_street_fallback(raw_input, city, postcode):
+    """
+    Strip matched city and postcode from raw input to isolate the street part
+    when the geocoder didn't return a specific street component.
+    """
+    if not raw_input:
+        return ""
+    s = str(raw_input).strip()
+
+    # Remove trailing country if it exists
+    s = re.sub(r",\s*[A-Za-z\s]+$", "", s)
+
+    # Remove postcode
+    if postcode:
+        s = re.sub(rf"\b{re.escape(str(postcode))}\b", "", s, flags=re.IGNORECASE)
+
+    # Remove city
+    if city:
+        s = re.sub(rf"\b{re.escape(str(city))}\b", "", s, flags=re.IGNORECASE)
+
+    # Clean up double commas, trailing commas, and extra spaces
+    s = re.sub(r",\s*,", ",", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[,\s]+$", "", s)
+    s = re.sub(r"^[,\s]+", "", s)
+
+    return s.strip()
 
 
 def _resolve_state_code(state_name: str) -> str:
@@ -241,35 +279,51 @@ def process_row_geocoding(row: dict, column_map: dict,
     result = geocode_address(normalized)
 
     if result["status"] != "OK":
-        return {
+        res = {
             "Geosource":       "Failed",
             "GeocodingStatus": result["status"],
         }
+        # In AIR, if only FullAddress was given and API fails, copy it to Street so the schema is not empty
+        if target_format == "AIR" and not row.get("Street"):
+            res["Street"] = row.get("FullAddress", "")
+        return res
 
     # ── Step 4: Map Geoapify result back to canonical key names ───────────────
     if target_format == "AIR":
+        # Determine isolated street if geocoder didn't return a specific one
+        final_street = result["street"]
+        if not final_street:
+            # Fallback: clean the input string of city/postcode
+            raw_in = row.get("Street") or row.get("FullAddress", "")
+            final_street = _clean_street_fallback(raw_in, result["city"], result["postcode"])
+
         return {
             "Latitude":          result["latitude"],
             "Longitude":         result["longitude"],
-            "Street":            result["street"],
-            "City":              result["city"],
-            "Area":              result["statecode"],
-            "PostalCode":        result["postcode"],
-            "CountryISO":        result["country_iso"],
+            "Street":            final_street,
+            "City":              result["city"] or row.get("City", ""),
+            "Area":              result["statecode"] or row.get("Area", ""),
+            "PostalCode":        result["postcode"] or row.get("PostalCode", ""),
+            "CountryISO":        result["country_iso"] or row.get("CountryISO", ""),
             "GeocodingStatus":   "OK",
             "Geosource":         "Geocoded",
             "Geo_Confidence":    result["confidence"],
             "StateCodeValidation": result["state_code_validation"],
         }
     else:  # RMS
+        final_street = result["street"]
+        if not final_street:
+            raw_in = row.get("STREETNAME") or row.get("FullAddress", "")
+            final_street = _clean_street_fallback(raw_in, result["city"], result["postcode"])
+
         return {
             "Latitude":          result["latitude"],
             "Longitude":         result["longitude"],
-            "STREETNAME":        result["street"],
-            "CITY":              result["city"],
-            "STATECODE":         result["statecode"],
-            "POSTALCODE":        result["postcode"],
-            "CNTRYCODE":         result["country_iso"],
+            "STREETNAME":        final_street,
+            "CITY":              result["city"] or row.get("CITY", ""),
+            "STATECODE":         result["statecode"] or row.get("STATECODE", ""),
+            "POSTALCODE":        result["postcode"] or row.get("POSTALCODE", ""),
+            "CNTRYCODE":         result["country_iso"] or row.get("CNTRYCODE", ""),
             "GeocodingStatus":   "OK",
             "Geosource":         "Geocoded",
             "Geo_Confidence":    result["confidence"],

@@ -36,6 +36,7 @@ load_dotenv()
 import session as session_store
 import code_mapper
 import geocoder
+import mapping_memory
 from column_mapper import suggest_columns, validate_required_fields
 from normalizer import normalize_all_rows
 from output_builder import build_xlsx, build_csv
@@ -113,6 +114,32 @@ def _load_iso4217() -> set:
 _VALID_CURRENCIES = _load_iso4217()
 
 
+def _enrich_excel_formats(content: bytes, df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+        ws = wb.active
+        col_currencies = {}
+        for col_idx in range(1, ws.max_column + 1):
+            if col_idx - 1 >= len(df.columns): break
+            col_name = df.columns[col_idx - 1]
+            for r in range(2, min(ws.max_row + 1, 10)):
+                cell = ws.cell(row=r, column=col_idx)
+                if cell.value is not None:
+                    fmt = str(cell.number_format or "")
+                    for sym in ["$", "€", "£", "¥", "₹"]:
+                        if sym in fmt:
+                            col_currencies[col_name] = sym
+                            break
+                    if col_name in col_currencies:
+                        break
+        for col, sym in col_currencies.items():
+            df[col] = df[col].apply(lambda v: f"{sym}{v}" if pd.notnull(v) and str(v).strip() != "" else v)
+    except Exception as e:
+        logger.warning(f"Could not extract Excel currency formats: {e}")
+    return df
+
+
 # ── Step 1: Upload ─────────────────────────────────────────────────────────────
 
 @app.post("/upload", response_model=UploadResponse, tags=["Pipeline"])
@@ -144,6 +171,7 @@ async def upload(
                 df = pd.read_csv(io.BytesIO(content), dtype=str, keep_default_na=False, encoding="latin-1")
         elif fname.endswith((".xlsx", ".xls")):
             df = pd.read_excel(io.BytesIO(content), dtype=str, keep_default_na=False, sheet_name=0)
+            df = _enrich_excel_formats(content, df)
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Upload CSV or XLSX.")
     except HTTPException:
@@ -227,6 +255,7 @@ def suggest_columns_endpoint(upload_id: str):
     return SuggestColumnsResponse(
         suggestions=suggestions_typed,
         unmapped=result["unmapped"],
+        memory_count=result.get("memory_count", 0),
     )
 
 
@@ -276,6 +305,12 @@ def confirm_columns(upload_id: str, body: ConfirmColumnsRequest):
         "unmapped_cols": unmapped,
     })
     session_store.session_mark_stage(upload_id, "column_map")
+
+    # ── Learn from this confirmed mapping ───────────────────────────────────────────
+    try:
+        mapping_memory.record_confirmed(column_map, session["target_format"])
+    except Exception as exc:
+        logger.warning(f"mapping_memory.record_confirmed failed (non-fatal): {exc}")
 
     logger.info(f"Session {upload_id}: column map confirmed, {mapped_count} mapped, {len(unmapped)} unmapped")
     return ConfirmColumnsResponse(
@@ -423,10 +458,9 @@ def map_codes_endpoint(upload_id: str):
             if result:
                 # ── Write mapped integer code to the canonical column the output builder reads ──
                 row[occ_value_col] = result["code"]      # e.g. row["OccupancyCode"] = 302
-                # Write scheme label only if not already set by the source data
+                # Write scheme label; default ATC for RMS, AIR for AIR
                 if not row.get(target_occ_scheme):
-                    row[target_occ_scheme] = target
-                # Preserve metadata in internal audit fields
+                    row[target_occ_scheme] = "ATC" if target == "RMS" else "AIR"
                 row["Occupancy_Code"]        = result["code"]
                 row["Occupancy_Description"] = result["description"]
                 row["Occupancy_Confidence"]  = result["confidence"]
@@ -451,10 +485,20 @@ def map_codes_endpoint(upload_id: str):
             key = f"const|{code_mapper.build_row_key(scheme, value)}"
             result = code_map.get(key, {})
             if result:
-                # ── Write mapped integer code to the canonical column the output builder reads ──
-                row[const_value_col] = result["code"]    # e.g. row["ConstructionCode"] = 215
-                # Write scheme label only if not already set by the source data
-                if not row.get(target_const_scheme):
+                # ── Write mapped code to the canonical column ───────────────
+                row[const_value_col] = result["code"]    # e.g. BLDGCLASS = "1"
+                # scheme_override: if the lookup determined a different scheme
+                # (e.g. Non-Combustible → FIRE instead of RMS), write it now.
+                scheme_override = result.get("scheme_override")
+                # scheme_override values ("RMS", "FIRE") are RMS EDM BLDGSCHEME
+                # vocabulary — they must ONLY be applied when target is RMS.
+                # For AIR targets, ConstructionCodeType usually is "AIR".
+                # However, if the mapper detected an "ISF" classification, preserve it.
+                if scheme_override == "ISF":
+                    row[target_const_scheme] = "ISF"
+                elif target == "RMS" and scheme_override:
+                    row[target_const_scheme] = scheme_override
+                elif not row.get(target_const_scheme):
                     row[target_const_scheme] = target
                 # Preserve metadata in internal audit fields
                 row["Construction_Code"]        = result["code"]
@@ -462,6 +506,7 @@ def map_codes_endpoint(upload_id: str):
                 row["Construction_Confidence"]  = result["confidence"]
                 row["Construction_Method"]      = result["method"]
                 row["Construction_Original"]    = result["original"]
+                row["Construction_Scheme"]      = row.get(target_const_scheme, target)
                 const_by_method[result["method"]] = const_by_method.get(result["method"], 0) + 1
                 if result["confidence"] < rules_config.const_confidence_threshold:
                     new_flags.append({
@@ -676,6 +721,114 @@ def delete_session(upload_id: str):
     if session_store.delete_session(upload_id):
         return {"deleted": upload_id}
     raise HTTPException(status_code=404, detail="Session not found.")
+
+
+# ── Pipeline Diff ──────────────────────────────────────────────────────────────────
+
+@app.get("/session-diff/{upload_id}", tags=["Pipeline"])
+def session_diff(upload_id: str, step: str = Query(..., regex="^(geocode|map-codes|normalize)$")):
+    """
+    Return before/after table data for a specific pipeline step, capped at 100 rows.
+    """
+    session = _get_session_or_404(upload_id)
+    target = session.get("target_format", "AIR")
+    _require_stage(session, "column_map", f"/session-diff (step={step})")
+
+    column_map = session.get("column_map", {})
+    raw_rows = session.get("raw_rows", [])
+
+    # Find which source columns mapped to the canonical fields we care about
+    def get_source_cols(canonicals):
+        return [src for src, can in column_map.items() if can in canonicals]
+
+    if step == "geocode":
+        _require_stage(session, "geocoding", f"/session-diff (step={step})")
+        air_addr = {"Street", "City", "Area", "PostalCode", "CountryISO", "Latitude", "Longitude"}
+        rms_addr = {"STREETNAME", "CITY", "STATECODE", "POSTALCODE", "CNTRYCODE", "Latitude", "Longitude"}
+        before_cols = get_source_cols(air_addr if target == "AIR" else rms_addr)
+        after_cols = ["Latitude", "Longitude", "GeocodingStatus", "Geosource"]
+        after_rows = session.get("geo_rows", [])
+
+    elif step == "map-codes":
+        _require_stage(session, "code_mapping", f"/session-diff (step={step})")
+        air_codes = {"OccupancyCode", "OccupancyCodeType", "ConstructionCode", "ConstructionCodeType"}
+        rms_codes = {"OCCTYPE", "OCCSCHEME", "BLDGCLASS", "BLDGSCHEME"}
+        before_cols = get_source_cols(air_codes if target == "AIR" else rms_codes)
+        after_cols = [
+            "Occupancy_Code", "Occupancy_Description", "Occupancy_Method",
+            "Construction_Code", "Construction_Description", "Construction_Method"
+        ]
+        after_rows = session.get("final_rows", session.get("geo_rows", []))
+
+    elif step == "normalize":
+        _require_stage(session, "normalization", f"/session-diff (step={step})")
+        air_norm = {
+            "YearBuilt", "NumberOfStories", "GrossArea", "BuildingValue",
+            "RoofGeometry", "WallSiding", "WallType", "FoundationType", "SoftStory", "SprinklerSystem"
+        }
+        rms_norm = {
+            "YEARBUILT", "NUMSTORIES", "FLOORAREA", "EQCV1VAL", 
+            "ROOFGEOM", "CLADDING", "WALLTYPE", "FOUNDATION", "SOFTSTORY", "SPRINKLER"
+        }
+        canonicals = air_norm if target == "AIR" else rms_norm
+        before_cols = get_source_cols(canonicals)
+        after_cols = list(canonicals)
+        after_rows = session.get("final_rows", [])
+
+    else:
+        raise HTTPException(status_code=400, detail="Invalid step")
+
+    limit = 100
+    rows_data = []
+
+    for i in range(min(len(raw_rows), len(after_rows))):
+        before_data = {c: raw_rows[i].get(c) for c in before_cols}
+        after_data = {c: after_rows[i].get(c) for c in after_cols}
+        # Only include row if it has some relevant data (not completely empty on both sides)
+        if any(v is not None and str(v).strip() != "" for v in list(before_data.values()) + list(after_data.values())):
+            rows_data.append({"before": before_data, "after": after_data})
+
+    return {
+        "step": step,
+        "columns": {"before": before_cols, "after": after_cols},
+        "rows": rows_data[:limit],
+        "total": len(rows_data)
+    }
+
+
+# ── Mapping Memory ─────────────────────────────────────────────────────────────────
+
+@app.get("/mapping-memory", tags=["Memory"])
+def get_mapping_memory(target_format: Optional[str] = Query(None, regex="^(AIR|RMS)$")):
+    """
+    List all learned column mapping memories.
+    Optionally filter by target_format (AIR or RMS).
+    Returns entries sorted by confirmed_count descending.
+    """
+    entries = mapping_memory.list_memory(target_format)
+    stats = mapping_memory.memory_stats()
+    return {
+        "entries": entries,
+        "total": len(entries),
+        "stats": stats,
+    }
+
+
+@app.delete("/mapping-memory/{source_col}", tags=["Memory"])
+def forget_mapping(source_col: str, target_format: str = Query("AIR", regex="^(AIR|RMS)$")):
+    """
+    Forget a single learned mapping.
+    source_col should be URL-encoded (e.g. 'building%20value').
+    target_format must be 'AIR' or 'RMS'.
+    """
+    deleted = mapping_memory.forget_mapping(source_col, target_format)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No memory entry found for '{source_col}' / {target_format}.",
+        )
+    logger.info(f"Memory forgotten: '{source_col}' / {target_format}")
+    return {"forgotten": source_col, "target_format": target_format}
 
 
 @app.get("/health", tags=["Health"])

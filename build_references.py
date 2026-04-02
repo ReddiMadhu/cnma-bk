@@ -1,12 +1,13 @@
 """
 build_references.py — One-time setup script.
 
-1. Reads AIR_static_data_corrected.xlsx and generates reference JSON files.
-2. Generates stub RMS reference JSON files (update when RMS data is available).
+1. Reads air_static_data.json to generate air_occ_codes.json and air_const_codes.json.
+2. Uses existing mapping files (atc_to_air_occ_map.json, rms_to_air_const_map.json)
+   to build the complete TF-IDF vocab for RMS codes.
 3. Creates abbreviations, iso3166_states, iso4217_currency JSON files.
 4. Builds and saves four TF-IDF vectorizer pkl files.
 
-Run from inside the cat_pipeline/ directory:
+Run from inside the directory:
   python build_references.py
 """
 import json
@@ -18,50 +19,36 @@ import sys
 BASE = pathlib.Path(__file__).parent
 REF = BASE / "reference"
 TFIDF = BASE / "tfidf_cache"
-XLSX_PATH = BASE / "AIR_static_data_corrected.xlsx"
+JSON_PATH = REF / "air_static_data.json"
 
 REF.mkdir(exist_ok=True)
 TFIDF.mkdir(exist_ok=True)
 
 # ── Check dependencies ─────────────────────────────────────────────────────────
 try:
-    import openpyxl
     from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
 except ImportError as e:
-    print(f"Missing dependency: {e}\nRun: pip install -r requirements.txt")
+    print(f"Missing dependency: {e}\nRun: pip install scikit-learn")
     sys.exit(1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — Read AIR static data from Excel
+# STEP 1 — Read AIR static data from extracted JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
-print(f"Reading: {XLSX_PATH}")
-if not XLSX_PATH.exists():
-    print(f"ERROR: Excel file not found at {XLSX_PATH}")
+print(f"Reading: {JSON_PATH}")
+if not JSON_PATH.exists():
+    print(f"ERROR: JSON file not found at {JSON_PATH}. Run extract_air_static_to_json.py first.")
     sys.exit(1)
 
-wb = openpyxl.load_workbook(XLSX_PATH, read_only=True)
+air_data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
 
-
-def read_sheet(sheet_name):
-    ws = wb[sheet_name]
-    rows = list(ws.iter_rows(values_only=True))
-    headers = [str(h).strip() if h else "" for h in rows[0]]
-    return [dict(zip(headers, row)) for row in rows[1:] if any(v is not None for v in row)]
-
-
-occ_data = read_sheet("occupancyData")
-const_data = read_sheet("constructionData")
-roof_data = read_sheet("roofCoverTypes")
-wall_data = read_sheet("wallTypes")
-foundation_data = read_sheet("foundationTypes")
-soft_story_data = read_sheet("softStoryTypes")
-biz_map_data = read_sheet("businessTypeOccupMapping")
+occ_data = air_data.get("occupancyData", [])
+const_data = air_data.get("constructionData", [])
+biz_map_data = air_data.get("businessTypeOccupMapping", [])
 
 # Build keyword enrichment from businessTypeOccupMapping
-biz_keywords: dict[str, list[str]] = {}
+biz_keywords = {}
 for row in biz_map_data:
     key = str(row.get("key") or "").strip().lower()
     code = str(row.get("value") or "").strip()
@@ -157,11 +144,8 @@ for row in occ_data:
     if not code or not description:
         continue
     keywords = list(OCC_SUPPLEMENTAL_KEYWORDS.get(code, []))
-    # Add biz map keywords
     keywords.extend(biz_keywords.get(code, []))
-    # Add description words as keywords
     keywords.append(description.lower())
-    # Deduplicate
     seen_kw = set()
     unique_kw = []
     for kw in keywords:
@@ -264,66 +248,49 @@ print(f"OK: Wrote {len(air_const_codes)} AIR construction codes -> {output_path}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — RMS stub codes (update when RMS data is provided)
+# STEP 4 — Build RMS Reference maps (flattened for TFIDF)
 # ─────────────────────────────────────────────────────────────────────────────
 
-rms_occ_codes = {
-    "Res1": {"description": "Single Family Dwelling", "keywords": ["single family", "house", "home", "sfr", "detached"]},
-    "Res2": {"description": "Mobile Home", "keywords": ["mobile home", "manufactured home", "trailer"]},
-    "Res3": {"description": "Multi-Family Dwelling (2-4 units)", "keywords": ["duplex", "triplex", "fourplex", "multi family small"]},
-    "Res4": {"description": "Multi-Family Dwelling (5+ units)", "keywords": ["apartment", "condominium", "condo", "multi family large"]},
-    "Res5": {"description": "Temporary Lodging", "keywords": ["hotel", "motel", "inn", "lodge"]},
-    "Res6": {"description": "Institutional Dormitory", "keywords": ["dormitory", "barracks", "group housing", "nursing home"]},
-    "Com1": {"description": "Retail Trade", "keywords": ["retail", "store", "shop", "mall", "shopping"]},
-    "Com2": {"description": "Wholesale Trade", "keywords": ["wholesale", "distribution", "distributor"]},
-    "Com3": {"description": "Personal and Repair Services", "keywords": ["salon", "repair", "laundry", "personal service"]},
-    "Com4": {"description": "Professional/Technical Services", "keywords": ["office", "professional", "business services", "consulting"]},
-    "Com5": {"description": "Banks/Financial", "keywords": ["bank", "financial", "insurance office", "credit union"]},
-    "Com6": {"description": "Hospital", "keywords": ["hospital", "medical center", "health care"]},
-    "Com7": {"description": "Medical Office/Clinic", "keywords": ["clinic", "medical office", "outpatient", "healthcare"]},
-    "Com8": {"description": "Entertainment & Recreation", "keywords": ["entertainment", "recreation", "gym", "fitness", "cinema", "theater"]},
-    "Com9": {"description": "Parking", "keywords": ["parking", "garage", "car park"]},
-    "Com10": {"description": "General Commercial", "keywords": ["commercial", "business", "general commercial"]},
-    "Ind1": {"description": "Light Industrial", "keywords": ["light industrial", "light manufacturing", "assembly"]},
-    "Ind2": {"description": "Heavy Industrial", "keywords": ["heavy industrial", "heavy manufacturing", "factory", "plant"]},
-    "Ind3": {"description": "Food/Drug/Chemical Processing", "keywords": ["food processing", "chemical", "pharmaceutical", "drug processing"]},
-    "Ind4": {"description": "Metals/Mining", "keywords": ["metal", "mining", "minerals", "foundry"]},
-    "Ind5": {"description": "High Technology", "keywords": ["high tech", "semiconductor", "data center", "technology"]},
-    "Ind6": {"description": "Construction/Maintenance", "keywords": ["construction", "contractor", "maintenance"]},
-    "Agr1": {"description": "Agriculture", "keywords": ["agriculture", "farm", "farming", "crop", "barn"]},
-    "Rel1": {"description": "Church/Religious", "keywords": ["church", "temple", "mosque", "synagogue", "place of worship"]},
-    "Gov1": {"description": "General Government Services", "keywords": ["government", "municipal", "city hall", "public"]},
-    "Gov2": {"description": "Emergency Response", "keywords": ["emergency", "fire station", "police station", "ambulance"]},
-    "Edu1": {"description": "Schools (K-12)", "keywords": ["school", "elementary", "high school", "k-12"]},
-    "Edu2": {"description": "Colleges/Universities", "keywords": ["university", "college", "campus", "higher education"]},
-}
+# Build RMS Occupancy from active ATC map
+atc_map_path = REF / "atc_to_air_occ_map.json"
+rms_occ_codes = {}
+if atc_map_path.exists():
+    _atc_raw = json.loads(atc_map_path.read_text(encoding="utf-8")).get("atc_to_air", {})
+    for atc_key, meta in _atc_raw.items():
+        desc = meta.get("description", "")
+        rms_occ_codes[atc_key] = {
+            "description": desc,
+            "keywords": [desc.lower()]
+        }
+    print(f"OK: Loaded {len(rms_occ_codes)} RMS occupancy codes for TF-IDF from atc_to_air_occ_map.")
 
-output_path = REF / "rms_occ_codes.json"
-output_path.write_text(json.dumps(rms_occ_codes, indent=2), encoding="utf-8")
-print(f"OK: Wrote {len(rms_occ_codes)} RMS occupancy codes (stub) -> {output_path}")
-
-rms_const_codes = {
-    "W1":  {"description": "Wood Light Frame", "keywords": ["wood frame", "light frame", "stick frame", "wf"]},
-    "W2":  {"description": "Wood Post and Beam", "keywords": ["post and beam", "heavy timber", "timber frame"]},
-    "S1":  {"description": "Steel Moment Frame", "keywords": ["steel moment frame", "smrf", "steel mrf"]},
-    "S2":  {"description": "Steel Braced Frame", "keywords": ["braced steel", "steel bracing", "cbf"]},
-    "S3":  {"description": "Steel Light Frame", "keywords": ["light metal", "light steel", "metal building", "pre-engineered"]},
-    "S4":  {"description": "Steel Frame with Concrete Shear Wall", "keywords": ["steel concrete shear wall", "dual system"]},
-    "S5":  {"description": "Steel Frame with URM Infill", "keywords": ["steel urm", "steel masonry infill"]},
-    "C1":  {"description": "Concrete Moment Frame", "keywords": ["concrete moment frame", "rc mrf", "reinforced concrete frame"]},
-    "C2":  {"description": "Concrete Shear Wall", "keywords": ["concrete shear wall", "rc shear wall"]},
-    "C3":  {"description": "Concrete Frame with URM Infill", "keywords": ["concrete urm", "rc frame masonry"]},
-    "PC1": {"description": "Precast Concrete Tilt-Up", "keywords": ["tilt-up", "tilt up", "precast tilt"]},
-    "PC2": {"description": "Precast Concrete Frame", "keywords": ["precast concrete", "pre-cast frame", "precast frame"]},
-    "RM1": {"description": "Reinforced Masonry Bearing Wall (Flexible Diaphragm)", "keywords": ["reinforced masonry", "rm", "reinforced brick"]},
-    "RM2": {"description": "Reinforced Masonry Bearing Wall (Stiff Diaphragm)", "keywords": ["reinforced masonry stiff", "rm stiff"]},
-    "URM": {"description": "Unreinforced Masonry", "keywords": ["unreinforced masonry", "urm", "unconfined masonry", "plain masonry"]},
-    "MH":  {"description": "Mobile Home", "keywords": ["mobile home", "manufactured home", "trailer"]},
-}
-
-output_path = REF / "rms_const_codes.json"
-output_path.write_text(json.dumps(rms_const_codes, indent=2), encoding="utf-8")
-print(f"OK: Wrote {len(rms_const_codes)} RMS construction codes (stub) -> {output_path}")
+# Build RMS Construction from active RMS map
+rms_const_map_path = REF / "rms_to_air_const_map.json"
+rms_const_codes = {}
+if rms_const_map_path.exists():
+    _rms_const_raw = json.loads(rms_const_map_path.read_text(encoding="utf-8"))
+    for category in ["basic", "advanced_structural", "infrastructure", "tanks", "industrial_equipment", "chimneys", "industrial_towers", "equipment", "industrial_facilities", "special_unknown"]:
+        for code, mapping in _rms_const_raw.get(category, {}).items():
+            desc = mapping.get("rms_desc", "")
+            keywords = mapping.get("keywords", [desc.lower()])
+            # We add keywords from our alias dict (same as code_mapper does)
+            _RMS_CONST_KEYWORD_ALIASES = {
+                "0":  ["unknown", "unspecified", "tbd", "unclassified"],
+                "1":  ["wood", "frame", "wood frame", "stick frame", "timber frame", "light frame", "light wood frame", "post frame", "pole barn", "adobe", "sip", "structural insulated panel", "modular wood"],
+                "2":  ["masonry", "brick", "cmu", "block", "joisted masonry", "jm", "unreinforced masonry", "urm", "stone masonry", "concrete block", "masonry bearing", "brick masonry"],
+                "3":  ["reinforced concrete", "concrete", "rc", "cast in place", "cip", "post tension", "flat slab", "waffle slab", "prestressed concrete", "concrete frame", "shear wall", "concrete shear wall"],
+                "4":  ["steel", "steel frame", "structural steel", "metal frame", "light gauge steel", "lgs", "steel stud", "steel joist", "braced frame", "moment frame", "steel deck"],
+                "5":  ["mobile home", "manufactured home", "trailer"],
+            }
+            if code in _RMS_CONST_KEYWORD_ALIASES:
+                keywords.extend(_RMS_CONST_KEYWORD_ALIASES[code])
+                keywords = list(dict.fromkeys(keywords))
+                
+            rms_const_codes[code] = {
+                "description": desc,
+                "keywords": keywords,
+            }
+    print(f"OK: Loaded {len(rms_const_codes)} RMS construction codes for TF-IDF from rms_to_air_const_map.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -387,7 +354,7 @@ iso3166_states = {
     "Northwest Territories": "NT", "Nova Scotia": "NS", "Nunavut": "NU",
     "Ontario": "ON", "Prince Edward Island": "PE", "Quebec": "QC",
     "Saskatchewan": "SK", "Yukon": "YT",
-    # ISO alpha-3 → alpha-2 lookup (stored under special key)
+    # ISO alpha-3 → alpha-2 lookup
     "_alpha3_to_alpha2": {
         "USA": "US", "GBR": "GB", "CAN": "CA", "AUS": "AU", "JPN": "JP",
         "CHN": "CN", "DEU": "DE", "FRA": "FR", "MEX": "MX", "BRA": "BR",
@@ -458,11 +425,11 @@ def build_tfidf_pkl(codes_dict: dict, output_pkl: pathlib.Path) -> None:
         pickle.dump({"vectorizer": vec, "matrix": matrix, "codes": code_list}, f)
     print(f"OK: TF-IDF index: {len(code_list)} codes, vocab={len(vec.vocabulary_)} -> {output_pkl}")
 
-
-build_tfidf_pkl(air_occ_codes,  TFIDF / "air_occ_vectorizer.pkl")
-build_tfidf_pkl(air_const_codes, TFIDF / "air_const_vectorizer.pkl")
-build_tfidf_pkl(rms_occ_codes,  TFIDF / "rms_occ_vectorizer.pkl")
-build_tfidf_pkl(rms_const_codes, TFIDF / "rms_const_vectorizer.pkl")
+if rms_occ_codes:
+    build_tfidf_pkl(air_occ_codes,  TFIDF / "air_occ_vectorizer.pkl")
+    build_tfidf_pkl(air_const_codes, TFIDF / "air_const_vectorizer.pkl")
+    build_tfidf_pkl(rms_occ_codes,  TFIDF / "rms_occ_vectorizer.pkl")
+    build_tfidf_pkl(rms_const_codes, TFIDF / "rms_const_vectorizer.pkl")
 
 
 print("\nDone:  All reference files and TF-IDF indexes built successfully.")

@@ -22,7 +22,7 @@ logger = logging.getLogger("output_builder")
 
 AIR_OUTPUT_COLUMNS: List[str] = [
     # Identity
-    "ContractID", "LocationID", "LocationName",
+    "PolicyID", "InsuredName", "LocationID", "LocationName",
     # Address
     "Street", "City", "Area", "PostalCode", "CountryISO",
     # Coordinates
@@ -104,6 +104,12 @@ def build_xlsx(
     # excluded from the Locations sheet to keep output clean and EDM-compliant.
     final_cols = base_cols
 
+    # Set AutoFit column widths based on the minimum length of standard column sizes + buffer
+    for i, col_name in enumerate(final_cols, start=1):
+        col_letter = get_column_letter(i)
+        # Ensure column width is wide enough for the header text at least
+        ws_loc.column_dimensions[col_letter].width = max(len(col_name) + 2, 12)
+
     # Styled header row
     header_cells = []
     for col_name in final_cols:
@@ -117,6 +123,7 @@ def build_xlsx(
 
     if target_format == "RMS":
         _clone_rms_perils(rows)
+        _format_rms_years(rows)
 
     # Data rows
     for i, row in enumerate(rows):
@@ -189,6 +196,7 @@ def build_csv(
 
     if target_format == "RMS":
         _clone_rms_perils(rows)
+        _format_rms_years(rows)
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=final_cols, extrasaction="ignore",
@@ -224,6 +232,21 @@ def _clone_rms_perils(rows: List[Dict]) -> None:
             if cur1 is not None and row.get(f"{prefix}1LCUR") is None: row[f"{prefix}1LCUR"] = cur1
             if cur2 is not None and row.get(f"{prefix}2LCUR") is None: row[f"{prefix}2LCUR"] = cur2
             if cur3 is not None and row.get(f"{prefix}3LCUR") is None: row[f"{prefix}3LCUR"] = cur3
+            
+def _format_rms_years(rows: List[Dict]) -> None:
+    """Format YEARBUILT and YEARUPGRAD to MM/DD/YYYY standard for RMS EDM."""
+    for row in rows:
+        for col in ("YEARBUILT", "YEARUPGRAD"):
+            val = row.get(col)
+            if val is not None and val != "":
+                try:
+                    y = int(val)
+                    if y == 9999:
+                        row[col] = "31//12/9999"
+                    elif 1700 <= y <= 2026:
+                        row[col] = f"01/01/{y}"
+                except (ValueError, TypeError):
+                    pass
 
 # ── QA Stats ───────────────────────────────────────────────────────────────────
 

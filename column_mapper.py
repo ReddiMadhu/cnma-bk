@@ -2,6 +2,10 @@
 column_mapper.py — Fuzzy + Gemini LLM column mapping using a LangGraph pipeline.
 
 Graph: fuzzy_matching → extract_llm_candidates → llm_matching → merge_results
+
+Memory layer: before the graph runs, mapping_memory.lookup_memory() short-circuits
+any source column that was previously confirmed by a human — returning score=1.0
+with method="memory" and skipping fuzzy/LLM entirely for those columns.
 """
 import json
 import logging
@@ -12,6 +16,8 @@ from typing import Any, Dict, List, Optional, TypedDict
 import google.generativeai as genai
 from langgraph.graph import END, StateGraph
 from rapidfuzz import fuzz, process
+
+import mapping_memory
 
 logger = logging.getLogger("column_mapper")
 
@@ -24,7 +30,8 @@ _gemini_model = genai.GenerativeModel(
 
 # ── AIR canonical fields + aliases ────────────────────────────────────────────
 AIR_CANONICAL_FIELDS: Dict[str, List[str]] = {
-    "ContractID":           ["contract id", "contract_id", "account id", "policy id", "policy number", "accntnum"],
+    "PolicyID":             ["contract id", "contract_id", "account id", "policy id", "policy number", "accntnum"],
+    "InsuredName":          ["insured name", "insured", "client", "customer name", "company name", "insured client"],
     "LocationID":           ["location id", "loc id", "loc_id", "location number", "loc no", "locid", "locnum"],
     "LocationName":         [
         "location name", "location description", "location",
@@ -49,7 +56,8 @@ AIR_CANONICAL_FIELDS: Dict[str, List[str]] = {
     "City":                 ["city", "town", "municipality", "locale", "city name", "town name",
                              "locality", "risk city", "site city", "property city", "insured city",
                              "branch city", "cty", "cty name", "loc city", "addr city"],
-    "Area":                 ["area", "county", "parish", "borough", "district", "state", "province",
+    "County":               ["county", "parish", "borough", "district"],
+    "Area":                 ["area", "state", "province",
                              "region", "statecode", "state code", "state cd", "state abbr", "st",
                              "st code", "st cd", "prov cd", "province code", "region state",
                              "risk state", "loc state", "site state", "addr state",
@@ -325,8 +333,8 @@ RMS_CANONICAL_FIELDS: Dict[str, List[str]] = {
     "STREETNAME":   ["street", "address", "street address", "streetname", "addr",
                      "street name", "addr line 1", "address 1", "address1"],
     "CITY":         ["city", "town", "municipality"],
-    "STATECODE":    ["state", "province", "region", "statecode", "state code",
-                     "county", "parish", "borough", "district"],
+    "COUNTY":       ["county", "parish", "borough", "district"],
+    "STATECODE":    ["state", "province", "region", "statecode", "state code"],
     "POSTALCODE":   ["zip", "postal code", "postcode", "postalcode", "zip code"],
     "CNTRYCODE":    ["country", "country code", "cntry", "cntrycode", "iso country"],
     "Latitude":     ["latitude", "lat", "y coordinate"],
@@ -779,38 +787,75 @@ def suggest_columns(
     cutoff: int = 50,
 ) -> Dict[str, Any]:
     """
-    Run the column mapping graph and return:
+    Run the column mapping pipeline and return:
     {
       "suggestions": {col: [{canonical, score, method, reason?}]},
       "unmapped": [cols with no suggestion >= cutoff]
     }
-    """
-    initial_state: ColumnMappingState = {
-        "target_format": target_format,
-        "source_columns": source_columns,
-        "sample_values": sample_values,
-        "fuzzy_results": {},
-        "llm_candidates": [],
-        "llm_results": {},
-        "final_suggestions": {},
-        "fuzzy_threshold": fuzzy_threshold,
-        "cutoff": cutoff,
-    }
 
-    result = _column_mapping_graph.invoke(initial_state)
-    final = result["final_suggestions"]
+    MEMORY LAYER (runs first):
+      Any source column whose normalised name exists in mapping_memory.json
+      is immediately assigned canonical=<remembered>, score=1.0, method="memory".
+      Those columns are excluded from the fuzzy+LLM graph, reducing latency and
+      LLM cost.  If ALL columns are covered by memory, the graph is skipped.
+    """
+    # ── Step 0: Memory lookup ──────────────────────────────────────────────────
+    memory_hits = mapping_memory.lookup_memory(source_columns, target_format)
+
+    # Columns not found in memory still need fuzzy / LLM
+    remaining_cols = [c for c in source_columns if c not in memory_hits]
+
+    # ── Step 1: Run fuzzy + LLM graph only for remaining columns ──────────────
+    graph_final: Dict[str, List[Dict]] = {}
+    if remaining_cols:
+        initial_state: ColumnMappingState = {
+            "target_format": target_format,
+            "source_columns": remaining_cols,
+            "sample_values": {k: v for k, v in sample_values.items() if k in remaining_cols},
+            "fuzzy_results": {},
+            "llm_candidates": [],
+            "llm_results": {},
+            "final_suggestions": {},
+            "fuzzy_threshold": fuzzy_threshold,
+            "cutoff": cutoff,
+        }
+        result = _column_mapping_graph.invoke(initial_state)
+        graph_final = result["final_suggestions"]
+
+    # ── Step 2: Merge memory hits + graph results ──────────────────────────────
+    final: Dict[str, List[Dict]] = {}
+    for col in source_columns:
+        if col in memory_hits:
+            hit = memory_hits[col]
+            final[col] = [{
+                "canonical": hit["canonical"],
+                "score": 1.0,
+                "method": "memory",
+                "reason": hit.get("reason", ""),
+                "count": hit.get("count", 1),
+            }]
+        else:
+            final[col] = graph_final.get(col, [])
+
+    memory_count = len(memory_hits)
+    if memory_count:
+        logger.info(
+            f"suggest_columns: {memory_count}/{len(source_columns)} columns "
+            f"resolved from memory (target={target_format})"
+        )
 
     unmapped = [col for col, sug in final.items() if not sug]
     return {
         "suggestions": final,
         "unmapped": unmapped,
+        "memory_count": memory_count,
     }
 
 
 def validate_required_fields(column_map: Dict[str, Optional[str]], target_format: str) -> List[str]:
     """Return list of required canonical fields not covered by the column_map."""
-    AIR_REQUIRED = {"LocationID", "OccupancyCode", "ConstructionCode", "LineOfBusiness"}
-    RMS_REQUIRED = {"LOCNUM", "OCCTYPE", "BLDGCLASS"}
+    AIR_REQUIRED = {"OccupancyCode", "ConstructionCode", "LineOfBusiness"}
+    RMS_REQUIRED = {"OCCTYPE", "BLDGCLASS"}
 
     required = AIR_REQUIRED if target_format == "AIR" else RMS_REQUIRED
     mapped_canonicals = set(v for v in column_map.values() if v)
