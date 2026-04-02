@@ -729,6 +729,9 @@ def delete_session(upload_id: str):
 def session_diff(upload_id: str, step: str = Query(..., regex="^(geocode|map-codes|normalize)$")):
     """
     Return before/after table data for a specific pipeline step, capped at 100 rows.
+    Includes all columns that appear in the final Excel output.
+    Also returns a `pairs` list: [{before_col, after_col, label}] so the UI can
+    render old → new columns adjacently.
     """
     session = _get_session_or_404(upload_id)
     target = session.get("target_format", "AIR")
@@ -737,60 +740,175 @@ def session_diff(upload_id: str, step: str = Query(..., regex="^(geocode|map-cod
     column_map = session.get("column_map", {})
     raw_rows = session.get("raw_rows", [])
 
-    # Find which source columns mapped to the canonical fields we care about
-    def get_source_cols(canonicals):
+    # Reverse map: canonical → source column name
+    canonical_to_src: Dict[str, str] = {}
+    for src, can in column_map.items():
+        if can and can not in canonical_to_src:
+            canonical_to_src[can] = src
+
+    def get_source_cols(canonicals: set) -> List[str]:
         return [src for src, can in column_map.items() if can in canonicals]
+
+    # pairs = [{"label": str, "before": src_col | None, "after": canonical_col | None}]
+    pairs: List[Dict] = []
+    after_rows: List[Dict] = []
 
     if step == "geocode":
         _require_stage(session, "geocoding", f"/session-diff (step={step})")
-        air_addr = {"Street", "City", "Area", "PostalCode", "CountryISO", "Latitude", "Longitude"}
-        rms_addr = {"STREETNAME", "CITY", "STATECODE", "POSTALCODE", "CNTRYCODE", "Latitude", "Longitude"}
-        before_cols = get_source_cols(air_addr if target == "AIR" else rms_addr)
-        after_cols = ["Latitude", "Longitude", "GeocodingStatus", "Geosource"]
         after_rows = session.get("geo_rows", [])
+
+        # Detect if user provided a single FullAddress column instead of separate fields
+        full_addr_src = canonical_to_src.get("FullAddress")  # source col name, or None
+        full_address_mode = bool(full_addr_src)
+
+        if target == "AIR":
+            addr_fields = [
+                ("Street",      "Street"),
+                ("City",        "City"),
+                ("Area",        "Area"),
+                ("PostalCode",  "PostalCode"),
+                ("CountryISO",  "CountryISO"),
+                ("Latitude",    "Latitude"),
+                ("Longitude",   "Longitude"),
+            ]
+        else:
+            addr_fields = [
+                ("STREETNAME",  "STREETNAME"),
+                ("CITY",        "CITY"),
+                ("STATECODE",   "STATECODE"),
+                ("POSTALCODE",  "POSTALCODE"),
+                ("CNTRYCODE",   "CNTRYCODE"),
+                ("Latitude",    "Latitude"),
+                ("Longitude",   "Longitude"),
+            ]
+
+        if full_address_mode:
+            # Single input (FullAddress) → many extracted outputs.
+            # Each pair's "before" is the full-address source col so the UI can show
+            # the raw string alongside each extracted component.
+            for canonical, after_col in addr_fields:
+                pairs.append({
+                    "label": after_col,
+                    "before": full_addr_src,    # always the same source column
+                    "after":  after_col,
+                    "before_is_full_address": True,  # hint for the UI
+                })
+        else:
+            # Normal field-by-field mapping
+            for canonical, after_col in addr_fields:
+                src = canonical_to_src.get(canonical)
+                pairs.append({"label": canonical, "before": src, "after": after_col})
+
+        # Geocoding-only outputs (no source equivalent)
+        pairs.append({"label": "GeocodingStatus", "before": None, "after": "GeocodingStatus"})
+        pairs.append({"label": "Geosource",       "before": None, "after": "Geosource"})
 
     elif step == "map-codes":
         _require_stage(session, "code_mapping", f"/session-diff (step={step})")
-        air_codes = {"OccupancyCode", "OccupancyCodeType", "ConstructionCode", "ConstructionCodeType"}
-        rms_codes = {"OCCTYPE", "OCCSCHEME", "BLDGCLASS", "BLDGSCHEME"}
-        before_cols = get_source_cols(air_codes if target == "AIR" else rms_codes)
-        after_cols = [
-            "Occupancy_Code", "Occupancy_Description", "Occupancy_Method",
-            "Construction_Code", "Construction_Description", "Construction_Method"
-        ]
         after_rows = session.get("final_rows", session.get("geo_rows", []))
+
+        if target == "AIR":
+            code_pairs = [
+                ("OccupancyCodeType",    "OccupancyCodeType",    "Occupancy_Code",         "Occ Code"),
+                ("OccupancyCode",        "OccupancyCode",        "Occupancy_Description",  "Occ Description"),
+                (None,                   None,                   "Occupancy_Method",       "Occ Method"),
+                ("ConstructionCodeType", "ConstructionCodeType", "Construction_Code",      "Const Code"),
+                ("ConstructionCode",     "ConstructionCode",     "Construction_Description","Const Description"),
+                (None,                   None,                   "Construction_Method",    "Const Method"),
+            ]
+        else:
+            code_pairs = [
+                ("OCCSCHEME",  "OCCSCHEME",  "Occupancy_Code",         "Occ Code"),
+                ("OCCTYPE",    "OCCTYPE",    "Occupancy_Description",  "Occ Description"),
+                (None,         None,         "Occupancy_Method",       "Occ Method"),
+                ("BLDGSCHEME", "BLDGSCHEME", "Construction_Code",      "Const Code"),
+                ("BLDGCLASS",  "BLDGCLASS",  "Construction_Description","Const Description"),
+                (None,         None,         "Construction_Method",    "Const Method"),
+            ]
+
+        for canonical, _, after_col, label in code_pairs:
+            src = canonical_to_src.get(canonical) if canonical else None
+            pairs.append({"label": label, "before": src, "after": after_col})
 
     elif step == "normalize":
         _require_stage(session, "normalization", f"/session-diff (step={step})")
-        air_norm = {
-            "YearBuilt", "NumberOfStories", "GrossArea", "BuildingValue",
-            "RoofGeometry", "WallSiding", "WallType", "FoundationType", "SoftStory", "SprinklerSystem"
-        }
-        rms_norm = {
-            "YEARBUILT", "NUMSTORIES", "FLOORAREA", "EQCV1VAL", 
-            "ROOFGEOM", "CLADDING", "WALLTYPE", "FOUNDATION", "SOFTSTORY", "SPRINKLER"
-        }
-        canonicals = air_norm if target == "AIR" else rms_norm
-        before_cols = get_source_cols(canonicals)
-        after_cols = list(canonicals)
         after_rows = session.get("final_rows", [])
+
+        if target == "AIR":
+            norm_pairs = [
+                ("YearBuilt",        "YearBuilt"),
+                ("YearRetrofitted",  "YearRetrofitted"),
+                ("NumberOfStories",  "NumberOfStories"),
+                ("RiskCount",        "RiskCount"),
+                ("GrossArea",        "GrossArea"),
+                ("BuildingValue",    "BuildingValue"),
+                ("ContentsValue",    "ContentsValue"),
+                ("TimeElementValue", "TimeElementValue"),
+                ("Currency",         "Currency"),
+                ("LineOfBusiness",   "LineOfBusiness"),
+                ("SprinklerSystem",  "SprinklerSystem"),
+                ("RoofGeometry",     "RoofGeometry"),
+                ("FoundationType",   "FoundationType"),
+                ("WallSiding",       "WallSiding"),
+                ("WallType",         "WallType"),
+                ("SoftStory",        "SoftStory"),
+            ]
+        else:
+            norm_pairs = [
+                ("YEARBUILT",   "YEARBUILT"),
+                ("YEARUPGRAD",  "YEARUPGRAD"),
+                ("NUMSTORIES",  "NUMSTORIES"),
+                ("NUMBLDGS",    "NUMBLDGS"),
+                ("FLOORAREA",   "FLOORAREA"),
+                ("EQCV1VAL",    "EQCV1VAL"),
+                ("EQCV2VAL",    "EQCV2VAL"),
+                ("EQCV3VAL",    "EQCV3VAL"),
+                ("EQCV1LCUR",   "EQCV1LCUR"),
+                ("SPRINKLER",   "SPRINKLER"),
+                ("ROOFGEOM",    "ROOFGEOM"),
+                ("FOUNDATION",  "FOUNDATION"),
+                ("CLADDING",    "CLADDING"),
+                ("WALLTYPE",    "WALLTYPE"),
+                ("SOFTSTORY",   "SOFTSTORY"),
+            ]
+
+        for canonical, after_col in norm_pairs:
+            src = canonical_to_src.get(canonical)
+            pairs.append({"label": canonical, "before": src, "after": after_col})
 
     else:
         raise HTTPException(status_code=400, detail="Invalid step")
+
+    # Derive flat before/after column lists from pairs (deduplicated, preserving order)
+    seen_before: set = set()
+    before_cols = []
+    for p in pairs:
+        c = p.get("before")
+        if c and c not in seen_before:
+            seen_before.add(c)
+            before_cols.append(c)
+    after_cols = [p["after"] for p in pairs if p.get("after")]
+
+    # Detect full_address_mode from pairs metadata
+    full_address_mode = any(p.get("before_is_full_address") for p in pairs)
+    full_address_src  = next((p["before"] for p in pairs if p.get("before_is_full_address")), None)
 
     limit = 100
     rows_data = []
 
     for i in range(min(len(raw_rows), len(after_rows))):
         before_data = {c: raw_rows[i].get(c) for c in before_cols}
-        after_data = {c: after_rows[i].get(c) for c in after_cols}
-        # Only include row if it has some relevant data (not completely empty on both sides)
+        after_data  = {c: after_rows[i].get(c)  for c in after_cols}
+        # Only include row if it has some relevant data on either side
         if any(v is not None and str(v).strip() != "" for v in list(before_data.values()) + list(after_data.values())):
             rows_data.append({"before": before_data, "after": after_data})
 
     return {
         "step": step,
         "columns": {"before": before_cols, "after": after_cols},
+        "pairs": pairs,
+        "full_address_mode": full_address_mode,
+        "full_address_src":  full_address_src,
         "rows": rows_data[:limit],
         "total": len(rows_data)
     }
