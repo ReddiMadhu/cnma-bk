@@ -1014,6 +1014,199 @@ def _find_code_columns(column_map: Dict, field_type: str, target: str):
     return scheme_col, value_col
 
 
+# ── Slip Summary (Done Page Dashboard) ────────────────────────────────────────
+
+def _safe_float(v) -> float:
+    """Parse a value to float, stripping currency symbols and commas."""
+    if v is None:
+        return 0.0
+    s = str(v).strip().replace(",", "").replace("$", "").replace("£", "").replace("€", "").replace("¥", "").replace("₹", "")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _bucket_year(year_val) -> str:
+    s = str(year_val or "").strip()
+    try:
+        y = int(float(s))
+        if y <= 0:
+            return "Unknown"
+        if y < 1995:
+            return "Pre 1995"
+        if y <= 2001:
+            return "1995 – 2001"
+        if y <= 2010:
+            return "2002 – 2010"
+        if y <= 2017:
+            return "2011 – 2017"
+        return "Post 2017"
+    except (ValueError, TypeError):
+        return "Unknown"
+
+
+def _bucket_stories(stories_val) -> str:
+    s = str(stories_val or "").strip()
+    try:
+        n = int(float(s))
+        if n <= 0:
+            return "Unknown"
+        if n == 1:
+            return "1"
+        if n <= 3:
+            return "2–3"
+        if n <= 7:
+            return "4–7"
+        return "7+"
+    except (ValueError, TypeError):
+        return "Unknown"
+
+
+@app.get("/slip-summary/{upload_id}", tags=["Output"])
+def slip_summary(upload_id: str):
+    """
+    Aggregate final_rows into SlipCoding dashboard metrics:
+    location_values, country_state, top_locations,
+    occupancy_dist, construction_dist, year_built_dist, stories_dist.
+    """
+    session = _get_session_or_404(upload_id)
+    _require_stage(session, "normalization", "/slip-summary")
+
+    target = session.get("target_format", "AIR")
+    final_rows = session.get("final_rows", [])
+    column_map = session.get("column_map", {})
+
+    # Determine value column names based on target
+    if target == "AIR":
+        bldg_col    = "BuildingValue"
+        cont_col    = "ContentsValue"
+        bi_col      = "TimeElementValue"
+        tiv_col     = "TIV"
+        occ_col     = "Occupancy_Description"
+        const_col   = "Construction_Description"
+        year_col    = "YearBuilt"
+        stories_col = "NumberOfStories"
+        country_col = "CountryISO"
+        state_col   = "Area"
+        city_col    = "City"
+        street_col  = "Street"
+        zip_col     = "PostalCode"
+        loc_id_col  = "LocationID"
+    else:  # RMS
+        bldg_col    = "EQCV1VAL"
+        cont_col    = "EQCV2VAL"
+        bi_col      = "EQCV3VAL"
+        tiv_col     = "TIV"
+        occ_col     = "Occupancy_Description"
+        const_col   = "Construction_Description"
+        year_col    = "YEARBUILT"
+        stories_col = "NUMSTORIES"
+        country_col = "CNTRYCODE"
+        state_col   = "STATECODE"
+        city_col    = "CITY"
+        street_col  = "STREETNAME"
+        zip_col     = "POSTALCODE"
+        loc_id_col  = "LOCNUM"
+
+    # ── Compute per-row TIV ───────────────────────────────────────────────────
+    total_bldg = total_cont = total_bi = total_tiv_col = 0.0
+    country_state_map: Dict[str, Dict] = {}
+    loc_rows = []
+    occ_map: Dict[str, float] = {}
+    const_map: Dict[str, float] = {}
+    year_map: Dict[str, float] = {}
+    story_map: Dict[str, float] = {}
+
+    for row in final_rows:
+        bldg = _safe_float(row.get(bldg_col))
+        cont = _safe_float(row.get(cont_col))
+        bi   = _safe_float(row.get(bi_col))
+        raw_tiv = _safe_float(row.get(tiv_col))
+
+        # Row-level TIV: if a dedicated TIV column exists use it,
+        # otherwise sum individual value columns
+        if raw_tiv > 0:
+            row_tiv = raw_tiv
+            # Distribute proportionally for bldg/cont/bi totals only when dedicated TIV is used
+            total_bldg  += bldg
+            total_cont  += cont
+            total_bi    += bi
+            total_tiv_col += raw_tiv
+        else:
+            row_tiv = bldg + cont + bi
+            total_bldg += bldg
+            total_cont += cont
+            total_bi   += bi
+
+        # Country / state
+        country = str(row.get(country_col) or "Unknown").strip() or "Unknown"
+        state   = str(row.get(state_col) or "NA").strip() or "NA"
+        cs_key  = f"{country}||{state}"
+        if cs_key not in country_state_map:
+            country_state_map[cs_key] = {"country": country, "state": state, "count": 0, "tiv": 0.0}
+        country_state_map[cs_key]["count"] += 1
+        country_state_map[cs_key]["tiv"]   += row_tiv
+
+        # Top locations (store raw row info + tiv)
+        loc_rows.append({
+            "loc_id":  str(row.get(loc_id_col) or ""),
+            "address": str(row.get(street_col) or ""),
+            "city":    str(row.get(city_col) or ""),
+            "state":   str(row.get(state_col) or ""),
+            "zip":     str(row.get(zip_col) or ""),
+            "tiv":     row_tiv,
+        })
+
+        # Occupancy
+        occ = str(row.get(occ_col) or row.get("OccupancyCode") or "Unknown").strip() or "Unknown"
+        occ_map[occ] = occ_map.get(occ, 0.0) + row_tiv
+
+        # Construction
+        const = str(row.get(const_col) or row.get("ConstructionCode") or "Unknown").strip() or "Unknown"
+        const_map[const] = const_map.get(const, 0.0) + row_tiv
+
+        # Year Built
+        yb = _bucket_year(row.get(year_col))
+        year_map[yb] = year_map.get(yb, 0.0) + row_tiv
+
+        # Stories
+        st = _bucket_stories(row.get(stories_col))
+        story_map[st] = story_map.get(st, 0.0) + row_tiv
+
+    grand_total = total_tiv_col if total_tiv_col > 0 else (total_bldg + total_cont + total_bi)
+
+    # Top 10 locations by TIV
+    top_locs = sorted(loc_rows, key=lambda r: r["tiv"], reverse=True)[:10]
+
+    # Country/state sorted by TIV desc
+    cs_list = sorted(country_state_map.values(), key=lambda r: r["tiv"], reverse=True)
+
+    # Ordered year buckets
+    year_order = ["Unknown", "Pre 1995", "1995 – 2001", "2002 – 2010", "2011 – 2017", "Post 2017"]
+    year_dist  = [{"label": k, "tiv": year_map.get(k, 0.0)} for k in year_order if k in year_map]
+
+    # Ordered story buckets
+    story_order = ["Unknown", "1", "2–3", "4–7", "7+"]
+    story_dist  = [{"label": k, "tiv": story_map.get(k, 0.0)} for k in story_order if k in story_map]
+
+    return {
+        "total_risks": len(final_rows),
+        "location_values": {
+            "building": total_bldg,
+            "contents": total_cont,
+            "bi":       total_bi,
+            "total":    grand_total,
+        },
+        "country_state":      cs_list,
+        "top_locations":      top_locs,
+        "occupancy_dist":     [{"label": k, "tiv": v} for k, v in sorted(occ_map.items(), key=lambda x: -x[1])],
+        "construction_dist":  [{"label": k, "tiv": v} for k, v in sorted(const_map.items(), key=lambda x: -x[1])],
+        "year_built_dist":    year_dist,
+        "stories_dist":       story_dist,
+    }
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
