@@ -39,7 +39,7 @@ import geocoder
 import mapping_memory
 from column_mapper import suggest_columns, validate_required_fields
 from normalizer import normalize_all_rows
-from output_builder import build_xlsx, build_csv
+from output_builder import build_xlsx, build_tsv, build_account_xlsx, build_account_tsv
 from rules import BusinessRulesConfig
 from models import (
     UploadResponse, SuggestColumnsResponse, ColumnSuggestion,
@@ -666,9 +666,9 @@ def correct(upload_id: str, body: CorrectRequest):
 @app.get("/download/{upload_id}", tags=["Output"])
 def download(
     upload_id: str,
-    format: str = Query("xlsx", regex="^(xlsx|csv)$"),
+    format: str = Query("xlsx", regex="^(xlsx|tsv)$"),
 ):
-    """Download the processed output as XLSX or CSV."""
+    """Download the processed output as XLSX or TSV."""
     session = _get_session_or_404(upload_id)
     _require_stage(session, "normalization", "/download")
 
@@ -678,16 +678,45 @@ def download(
     target = session.get("target_format", "AIR")
     short_id = upload_id[:8]
 
-    if format == "csv":
-        buf = build_csv(final_rows, unmapped_cols, target)
-        filename = f"cat_output_{short_id}.csv"
-        media_type = "text/csv"
+    if format == "tsv":
+        buf = build_tsv(final_rows, unmapped_cols, target)
+        filename = f"cat_output_{short_id}.tsv"
+        media_type = "text/tab-separated-values"
     else:
         buf = build_xlsx(final_rows, unmapped_cols, flags, target, upload_id)
         filename = f"cat_output_{short_id}.xlsx"
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     logger.info(f"Session {upload_id}: download requested ({format}), {len(final_rows)} rows")
+    return StreamingResponse(
+        buf,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@app.get("/download-account/{upload_id}", tags=["Output"])
+def download_account(
+    upload_id: str,
+    format: str = Query("xlsx", regex="^(xlsx|tsv)$"),
+):
+    """Download the account file output as XLSX or TSV."""
+    session = _get_session_or_404(upload_id)
+    _require_stage(session, "normalization", "/download-account")
+
+    final_rows = session.get("final_rows", [])
+    target = session.get("target_format", "AIR")
+    short_id = upload_id[:8]
+
+    if format == "tsv":
+        buf = build_account_tsv(final_rows, target)
+        filename = f"account_output_{short_id}.tsv"
+        media_type = "text/tab-separated-values"
+    else:
+        buf = build_account_xlsx(final_rows, target)
+        filename = f"account_output_{short_id}.xlsx"
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    logger.info(f"Session {upload_id}: account download requested ({format}), {len(final_rows)} source rows")
     return StreamingResponse(
         buf,
         media_type=media_type,
